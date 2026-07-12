@@ -34,11 +34,3 @@
 > 因此不需另外接 CS。若接線後畫面異常，可嘗試將 BLK 直接接 3.3V 確認是否為背光腳位問題。
 
 ## esp32cam 連接st7789 做影像傳輸
-
-GND GND
-VCC 3.3V
-SCL GPIO_14
-SDA GPIO_13
-RES GPIO_12
-DC GPIO_2
-BLK NC
