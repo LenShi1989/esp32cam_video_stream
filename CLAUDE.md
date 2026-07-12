@@ -33,4 +33,20 @@
 > 注意：ESP32-CAM 只有一組 SPI 排線可用的腳位較少，此模組沒有獨立 CS 腳位，
 > 因此不需另外接 CS。若接線後畫面異常，可嘗試將 BLK 直接接 3.3V 確認是否為背光腳位問題。
 
+## TFT_eSPI 設定
+
+文件\Arduino\libraries\TFT_eSPI
+取消註解
+User_Setup_Select.h
+
+- #include <User_Setups/Setup24_ST7789.h>
+
+Setup24_ST7789.h 設定
+
+- #define TFT_MOSI 13
+- #define TFT_SCLK 14
+- #define TFT_CS -1 // Not connected
+- #define TFT_DC 2
+- #define TFT_RST 12
+
 ## esp32cam 連接st7789 做影像傳輸
