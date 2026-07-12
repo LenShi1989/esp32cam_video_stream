@@ -5,7 +5,6 @@
 工作電壓：3.3V ~ 5V
 連結方法：2.54mm DIP
 通訊方式：SPI通訊
-通訊方式：SPI通訊
 腳位說明：
 
 - ◎ VCC：供電端
@@ -21,17 +20,25 @@
 以下接線表使用 ESP32-CAM（AI-Thinker）**未使用 microSD 卡**時釋放出來的 GPIO12~15，
 避免與相機（HS2_DATA1/GPIO4、GPIO0 XCLK）及燒錄用序列埠（GPIO1/GPIO3）衝突：
 
-| ST7789 腳位 | 說明          | ESP32-CAM 腳位               |
-| ----------- | ------------- | ---------------------------- |
-| VCC         | 供電 3.3V     | 3.3V                         |
-| GND         | 接地          | GND                          |
-| SCK         | SPI 時脈      | GPIO14                       |
-| SDA         | SPI MOSI      | GPIO13                       |
-| RES         | 重新啟動      | GPIO15                       |
-| DC          | 資料/指令選擇 | GPIO2                        |
-| BLK         | 背光控制      | GPIO12（或直接接 3.3V 恆亮） |
+| ST7789 腳位 | 說明          | ESP32-CAM 腳位 |
+| ----------- | ------------- | -------------- |
+| VCC         | 供電 3.3V     | 3.3V           |
+| GND         | 接地          | GND            |
+| SCK         | SPI 時脈      | GPIO_14        |
+| SDA         | SPI MOSI      | GPIO_13        |
+| RES         | 重新啟動      | GPIO_12        |
+| DC          | 資料/指令選擇 | GPIO_2         |
+| BLK         | 背光控制      | NC             |
 
 > 注意：ESP32-CAM 只有一組 SPI 排線可用的腳位較少，此模組沒有獨立 CS 腳位，
 > 因此不需另外接 CS。若接線後畫面異常，可嘗試將 BLK 直接接 3.3V 確認是否為背光腳位問題。
 
 ## esp32cam 連接st7789 做影像傳輸
+
+GND GND
+VCC 3.3V
+SCL GPIO_14
+SDA GPIO_13
+RES GPIO_12
+DC GPIO_2
+BLK NC
