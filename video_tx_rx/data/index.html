@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-CAM 設定</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f2f4f8;
+    --card: #ffffff;
+    --text: #1c2333;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-dark: #1d4ed8;
+    --ok: #16a34a;
+    --err: #dc2626;
+    --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 48px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
+  }
+  .wrap { max-width: 420px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 16px; text-align: center; }
+  .card {
+    background: var(--card);
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  .status-line { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); }
+  .dot.busy { background: #f59e0b; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  button {
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:active { background: var(--accent-dark); }
+  button.secondary { background: #eef1f6; color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  ul.nets { list-style: none; margin: 12px 0 0; padding: 0; max-height: 240px; overflow-y: auto; }
+  ul.nets li {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 8px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 14px;
+  }
+  ul.nets li:last-child { border-bottom: none; }
+  ul.nets li.selected { background: #eff6ff; border-radius: 8px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 10px 12px; margin-top: 8px;
+    border: 1px solid var(--border); border-radius: 10px; font-size: 14px;
+  }
+  .msg { margin-top: 10px; font-size: 13px; }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--err); }
+  .switch { position: relative; width: 54px; height: 30px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0; background: #d1d5db; border-radius: 30px;
+    transition: background .2s; cursor: pointer;
+  }
+  .slider::before {
+    content: ""; position: absolute; width: 24px; height: 24px; left: 3px; top: 3px;
+    background: #fff; border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 2px rgba(0,0,0,.3);
+  }
+  input:checked + .slider { background: var(--ok); }
+  input:checked + .slider::before { transform: translateX(24px); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ESP32-CAM 設定</h1>
+
+  <div class="card">
+    <div class="status-line"><span id="statusDot" class="dot"></span><span id="statusText">讀取狀態中...</span></div>
+  </div>
+
+  <div id="wifiCard" class="card hidden">
+    <div class="row">
+      <strong>Wi-Fi 設定</strong>
+      <button id="scanBtn" class="secondary" type="button">掃描</button>
+    </div>
+    <ul id="netList" class="nets"></ul>
+    <div style="margin-top:14px;">
+      <input id="ssidInput" type="text" placeholder="SSID (可點選上方列表或手動輸入)">
+      <input id="passInput" type="password" placeholder="密碼 (開放網路可留空)">
+      <div class="row" style="margin-top:12px;">
+        <button id="connectBtn" type="button">連線</button>
+        <span id="connMsg" class="msg"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="ledCard" class="card hidden">
+    <div class="row">
+      <div>
+        <strong>GPIO4 LED</strong>
+        <div class="muted" id="ledHint">目前狀態：--</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="ledToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <p class="muted" style="text-align:center;">連線後仍可保持連上 esp32_init 這個熱點以重新設定 Wi-Fi</p>
+</div>
+
+<script>
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const wifiCard = document.getElementById('wifiCard');
+const ledCard = document.getElementById('ledCard');
+const netList = document.getElementById('netList');
+const ssidInput = document.getElementById('ssidInput');
+const passInput = document.getElementById('passInput');
+const connectBtn = document.getElementById('connectBtn');
+const connMsg = document.getElementById('connMsg');
+const scanBtn = document.getElementById('scanBtn');
+const ledToggle = document.getElementById('ledToggle');
+const ledHint = document.getElementById('ledHint');
+
+let ledSyncing = false;
+
+async function refreshStatus() {
+  try {
+    const res = await fetch('/status');
+    const data = await res.json();
+
+    if (data.connected) {
+      statusDot.className = 'dot on';
+      statusText.textContent = '已連線: ' + data.ssid + ' (' + data.ip + ')';
+      wifiCard.classList.add('hidden');
+      ledCard.classList.remove('hidden');
+    } else if (data.connecting) {
+      statusDot.className = 'dot busy';
+      statusText.textContent = '連線中...';
+      wifiCard.classList.remove('hidden');
+      ledCard.classList.add('hidden');
+    } else {
+      statusDot.className = 'dot';
+      statusText.textContent = 'AP 模式 (尚未連上 Wi-Fi)';
+      wifiCard.classList.remove('hidden');
+      ledCard.classList.add('hidden');
+    }
+
+    if (!ledSyncing) {
+      ledToggle.checked = !!data.led;
+      ledHint.textContent = '目前狀態：' + (data.led ? '亮' : '滅');
+    }
+  } catch (e) {
+    statusDot.className = 'dot';
+    statusText.textContent = '無法取得狀態';
+  }
+}
+
+async function doScan() {
+  scanBtn.disabled = true;
+  scanBtn.textContent = '掃描中...';
+  netList.innerHTML = '';
+  try {
+    const res = await fetch('/scan');
+    const nets = await res.json();
+    nets.sort((a, b) => b.rssi - a.rssi);
+    nets.forEach(n => {
+      const li = document.createElement('li');
+      li.textContent = (n.secure ? '🔒 ' : '') + n.ssid + '  ';
+      const rssi = document.createElement('span');
+      rssi.className = 'muted';
+      rssi.textContent = n.rssi + ' dBm';
+      li.appendChild(rssi);
+      li.addEventListener('click', () => {
+        ssidInput.value = n.ssid;
+        passInput.focus();
+        [...netList.children].forEach(c => c.classList.remove('selected'));
+        li.classList.add('selected');
+      });
+      netList.appendChild(li);
+    });
+    if (nets.length === 0) {
+      netList.innerHTML = '<li class="muted">找不到任何 Wi-Fi</li>';
+    }
+  } catch (e) {
+    netList.innerHTML = '<li class="muted">掃描失敗</li>';
+  }
+  scanBtn.disabled = false;
+  scanBtn.textContent = '掃描';
+}
+
+async function doConnect() {
+  const ssid = ssidInput.value.trim();
+  if (!ssid) {
+    connMsg.className = 'msg err';
+    connMsg.textContent = '請輸入或選擇 SSID';
+    return;
+  }
+  connectBtn.disabled = true;
+  connMsg.className = 'msg';
+  connMsg.textContent = '連線中，請稍候...';
+  try {
+    const body = new URLSearchParams({ ssid, password: passInput.value });
+    const res = await fetch('/connect', { method: 'POST', body });
+    const data = await res.json();
+    if (data.ok) {
+      connMsg.className = 'msg ok';
+      connMsg.textContent = '已送出連線請求，請稍候...';
+    } else {
+      connMsg.className = 'msg err';
+      connMsg.textContent = data.error || '連線請求失敗';
+    }
+  } catch (e) {
+    connMsg.className = 'msg err';
+    connMsg.textContent = '連線請求失敗';
+  }
+  connectBtn.disabled = false;
+}
+
+ledToggle.addEventListener('change', async () => {
+  ledSyncing = true;
+  const state = ledToggle.checked ? '1' : '0';
+  try {
+    const res = await fetch('/led?state=' + state);
+    const data = await res.json();
+    ledHint.textContent = '目前狀態：' + (data.led ? '亮' : '滅');
+  } catch (e) { /* 下次輪詢會自動修正畫面 */ }
+  ledSyncing = false;
+});
+
+scanBtn.addEventListener('click', doScan);
+connectBtn.addEventListener('click', doConnect);
+
+refreshStatus();
+setInterval(refreshStatus, 2000);
+doScan();
+</script>
+</body>
+</html>

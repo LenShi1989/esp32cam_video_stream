@@ -1,5 +1,13 @@
 # esp32cam 影像傳輸
 
+原始核心:1
+
+- Web Server
+
+備用核心:0
+
+- camera影像傳輸st7789
+
 ## 使用 st7789 240 x 240 TFT LCD顯示器
 
 工作電壓：3.3V ~ 5V
@@ -50,3 +58,25 @@ Setup24_ST7789.h 設定
 - #define TFT_RST 12
 
 ## esp32cam 連接st7789 做影像傳輸
+
+使用 SPIFFS Web Server（實作於 `video_tx_rx/video_tx_rx.ino`，網頁檔在 `video_tx_rx/data/index.html`）：
+
+- ESP32 開 AP
+  - SSID：`esp32_init`（開放網路，無密碼）
+- 設定 Wi-Fi 連線
+  - 掃描附近 SSID（GET `/scan`）
+  - 輸入 SSID + PASSWORD 送出連線（POST `/connect`，同時存入 NVS，下次開機自動嘗試重連）
+- 連線成功
+  - 網頁切換為一顆開關，控制 GPIO4 LED 亮滅（GET `/led?state=0|1`）
+  - GPIO4 為 AI-Thinker 板載強光 LED，未使用 microSD 卡時與相機、TFT 腳位皆不衝突
+
+核心分工：
+
+- 原始核心 (core 1，`setup()`/`loop()`)：Wi-Fi AP/STA + WebServer + LED 控制
+- 備用核心 (core 0，`xTaskCreatePinnedToCore`)：相機擷取影像並串流顯示到 ST7789
+
+燒錄注意事項：
+
+- Partition Scheme 需選含 SPIFFS 的方案（`.vscode/arduino.json` 已設為 `min_spiffs`）
+- `video_tx_rx/data/index.html` 需另外上傳到 SPIFFS，才能讓 `/` 網頁正常顯示
+  （例如使用 Arduino IDE 的 ESP32 Sketch Data Upload 外掛，或 arduino-cli + mkspiffs/esptool 燒錄 `data` 資料夾）

@@ -50,3 +50,10 @@ Setup24_ST7789.h 設定
 - #define TFT_RST 12
 
 ## esp32cam 連接st7789 做影像傳輸
+
+使用 SPIFFS Web Server（`video_tx_rx/video_tx_rx.ino` + `video_tx_rx/data/index.html`）：
+
+- ESP32 開 AP，SSID `esp32_init`（開放網路），提供網頁掃描附近 Wi-Fi、輸入密碼連線
+- 連線成功後網頁切換為開關，控制 GPIO4 LED 亮滅
+- 核心分工：core 1 (Arduino `loop()`) 跑 Web Server，core 0 (獨立 task) 跑相機 -> ST7789 串流
+- 燒錄前需將 `video_tx_rx/data/index.html` 上傳到 ESP32 的 SPIFFS，並使用含 SPIFFS 的 Partition Scheme（如 `min_spiffs`）

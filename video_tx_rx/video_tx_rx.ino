@@ -1,7 +1,12 @@
 /*
   esp32cam_video_stream
-  ESP32-CAM (AI-Thinker) 直接將相機影像串流顯示在外接的 ST7789 240x240 TFT LCD 上。
-  不經過 WiFi，相機擷取 (tx) 與顯示 (rx) 都在同一顆 ESP32 上完成。
+
+  雙核心分工 (依 CLAUDE.md)：
+    - 原始核心 (core 1，即 Arduino setup()/loop())：
+      Web Server：開 AP (SSID esp32_init) -> 掃描/設定 Wi-Fi -> 連線成功後
+      提供網頁開關控制 GPIO4 LED 亮滅。
+    - 備用核心 (core 0，透過 xTaskCreatePinnedToCore 建立)：
+      相機擷取影像並直接串流顯示到外接的 ST7789 240x240 TFT LCD，不經過 WiFi。
 
   接線請參考 README.md / CLAUDE.md：
     ST7789 SCK -> GPIO14
@@ -14,41 +19,32 @@
   需要的函式庫 (Library Manager 安裝)：
     - TFT_eSPI (Bodmer)
 
-  本檔案透過在 #include <TFT_eSPI.h> 之前定義 USER_SETUP_LOADED 及各項腳位，
-  直接在專案內覆寫函式庫的 User_Setup.h，不需另外修改函式庫本身的設定檔。
-
   開發板需選擇 "AI Thinker ESP32-CAM"，並開啟 PSRAM (Enabled)。
+  Partition Scheme 需選擇含 SPIFFS 的方案 (例如 min_spiffs)，才有空間放網頁檔案。
+
+  網頁檔案 (video_tx_rx/data/index.html) 需另外上傳到 ESP32 的 SPIFFS，
+  例如使用 arduino-esp32fs-plugin 的 "ESP32 Sketch Data Upload"，
+  或透過 arduino-cli + mkspiffs/esptool 燒錄 data 資料夾內容。
 */
 
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_camera.h"
 #include <SPI.h>
+// FS.h 必須在 TFT_eSPI.h 之前先引入：TFT_eSPI 的 ESP32 處理器標頭會以
+// #define FS_NO_GLOBALS 引入 FS.h，導致 fs::FS/fs::File 不會別名到全域的
+// FS/File，造成 WebServer.h 及下面的 SPIFFS 存取編譯失敗。在此先正常引入一次，
+// 之後 TFT_eSPI 內的重複引入會因 include guard 而略過，全域別名得以保留。
+#include <FS.h>
 #include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <Preferences.h>
 
-// ---------- TFT_eSPI 設定 (取代函式庫內的 User_Setup.h) ----------
-// #define USER_SETUP_LOADED 1
-// #define ST7789_DRIVER
-
+// ---------- TFT 顯示尺寸 ----------
 #define TFT_WIDTH 240
 #define TFT_HEIGHT 240
-
-// 常見的 240x240 ST7789 模組面板色序為 BGR，若實際顯示顏色是反的 (紅藍互換)，
-// 可改成 #define TFT_RGB_ORDER TFT_RGB 試試看。
-// #define TFT_RGB_ORDER TFT_BGR
-
-// #define USE_HSPI_PORT
-
-// #define TFT_MOSI 13
-// #define TFT_SCLK 14
-// #define TFT_MISO -1 // 未使用
-// #define TFT_RST 12
-// #define TFT_DC 2
-// #define TFT_CS -1 // 此模組無獨立 CS 腳位
-// #define TFT_BL -1 // BLK 未接線 (NC)，依模組預設常亮
-
-// #define SPI_FREQUENCY 10000000 // 先降速確認排線可正常通訊，穩定後可再調高
-// #define SPI_READ_FREQUENCY 10000000
 
 // ---------- AI-Thinker ESP32-CAM 相機腳位 ----------
 #define CAM_PIN_PWDN 32
@@ -68,7 +64,143 @@
 #define CAM_PIN_HREF 23
 #define CAM_PIN_PCLK 22
 
+// ---------- Web Server / Wi-Fi / LED 設定 ----------
+#define LED_PIN 4  // AI-Thinker 板載強光 LED，與相機腳位不衝突
+#define AP_SSID "esp32_init"
+#define WIFI_PREF_NAMESPACE "wifi"
+static const unsigned long STA_CONNECT_TIMEOUT_MS = 15000;
+
 TFT_eSPI tft = TFT_eSPI();
+WebServer server(80);
+Preferences wifiPrefs;
+
+volatile bool ledState = false;
+bool staConnecting = false;
+unsigned long staConnectStart = 0;
+
+static bool initCamera();
+void cameraTask(void *param);
+String jsonEscape(const String &s);
+void handleRoot();
+void handleScan();
+void handleConnect();
+void handleStatus();
+void handleLed();
+void tryAutoConnectSavedWifi();
+
+// ================= setup / loop：core 1 = Web Server =================
+
+void setup()
+{
+  // 關閉 brownout 偵測，避免相機啟動瞬間電流過大導致重開機
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  Serial.println("ESP32-CAM 啟動中 (core1=Web Server, core0=camera->TFT)...");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("SPIFFS 掛載失敗，網頁將無法載入");
+  }
+
+  // AP + STA 同時開啟：手機可持續連著 esp32_init 這個熱點進行設定，
+  // 同時 ESP32 也能以 STA 模式連上使用者選擇的 Wi-Fi。
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID);
+  // 降低 WiFi 發射功率以減少尖峰電流，避免與相機/TFT 同時運作時因供電不足
+  // (電壓瞬間下降) 導致 SPI Flash 讀取錯誤而觸發 IllegalInstruction 當機。
+  // 供電穩定 (建議由外部 5V/2A 供應並加大電容旁路) 後可調高或移除此行。
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+  Serial.print("AP 已啟動，SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  tryAutoConnectSavedWifi();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/scan", HTTP_GET, handleScan);
+  server.on("/connect", HTTP_POST, handleConnect);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/led", HTTP_GET, handleLed);
+  server.begin();
+  Serial.println("Web Server 已啟動 (core 1)");
+
+  // 相機擷取 + TFT 顯示放到備用核心 (core 0)，避免與 Web Server 互相卡住
+  xTaskCreatePinnedToCore(cameraTask, "cameraTask", 10240, NULL, 1, NULL, 0);
+}
+
+void loop()
+{
+  server.handleClient();
+
+  if (staConnecting)
+  {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      staConnecting = false;
+      Serial.print("Wi-Fi 連線成功, IP: ");
+      Serial.println(WiFi.localIP());
+    }
+    else if (millis() - staConnectStart > STA_CONNECT_TIMEOUT_MS)
+    {
+      staConnecting = false;
+      Serial.println("Wi-Fi 連線逾時");
+    }
+  }
+}
+
+// ================= core 0：相機影像 -> ST7789 =================
+
+void cameraTask(void *param)
+{
+  tft.init();
+  tft.setRotation(1); // 0~3，順時針旋轉 90°
+
+  if (!initCamera())
+  {
+    tft.setCursor(10, 100);
+    tft.setTextColor(TFT_RED);
+    tft.println("Camera init failed!");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  Serial.println("相機初始化完成，開始串流 (core 0)");
+
+  bool printedInfo = false;
+  for (;;)
+  {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb)
+    {
+      Serial.println("擷取影像失敗");
+      continue;
+    }
+
+    if (!printedInfo)
+    {
+      Serial.printf("實際擷取畫面: %dx%d, format=%d, len=%d\n", fb->width, fb->height, fb->format, fb->len);
+      printedInfo = true;
+    }
+
+    if (fb->format == PIXFORMAT_RGB565)
+    {
+      // 相機實際協商出的解析度不一定剛好是 240x240，置中顯示避免因尺寸不符而整張跳過
+      int16_t x = (TFT_WIDTH - fb->width) / 2;
+      int16_t y = (TFT_HEIGHT - fb->height) / 2;
+      tft.startWrite();
+      tft.setAddrWindow(x, y, fb->width, fb->height);
+      tft.pushPixels((uint16_t *)fb->buf, fb->len / 2);
+      tft.endWrite();
+    }
+
+    esp_camera_fb_return(fb);
+  }
+}
 
 static bool initCamera()
 {
@@ -117,70 +249,114 @@ static bool initCamera()
   return true;
 }
 
-void setup()
+// ================= Web Server 處理函式 =================
+
+String jsonEscape(const String &s)
 {
-  // 關閉 brownout 偵測，避免相機啟動瞬間電流過大導致重開機
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
-  Serial.begin(115200);
-  Serial.println("ESP32-CAM -> ST7789 影像串流啟動中...");
-
-  tft.init();
-  tft.setRotation(1); // 0~3，順時針旋轉 90°
-
-  // 自我測試：確認 SPI/接線本身沒問題，與相機資料無關
-  // 若這裡看不到紅/綠/藍全螢幕依序顯示，代表問題在 TFT 接線或初始化，不是相機
-  // Serial.println("TFT 自我測試: 紅");
-  // tft.fillScreen(TFT_RED);
-  // delay(800);
-  // Serial.println("TFT 自我測試: 綠");
-  // tft.fillScreen(TFT_GREEN);
-  // delay(800);
-  // Serial.println("TFT 自我測試: 藍");
-  // tft.fillScreen(TFT_BLUE);
-  // delay(800);
-  // tft.fillScreen(TFT_BLACK);
-
-  if (!initCamera())
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); i++)
   {
-    tft.setCursor(10, 100);
-    tft.setTextColor(TFT_RED);
-    tft.println("Camera init failed!");
-    while (true)
+    char c = s[i];
+    if (c == '"' || c == '\\')
     {
-      delay(1000);
+      out += '\\';
     }
+    out += c;
   }
-
-  Serial.println("初始化完成，開始串流");
+  return out;
 }
 
-void loop()
+void handleRoot()
 {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb)
+  File f = SPIFFS.open("/index.html", "r");
+  if (!f)
   {
-    Serial.println("擷取影像失敗");
+    server.send(500, "text/plain", "index.html not found，請先上傳 SPIFFS data 資料夾");
+    return;
+  }
+  server.streamFile(f, "text/html");
+  f.close();
+}
+
+void handleScan()
+{
+  int n = WiFi.scanNetworks();
+  String json = "[";
+  for (int i = 0; i < n; i++)
+  {
+    if (i > 0)
+    {
+      json += ",";
+    }
+    json += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+            ",\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
+  }
+  json += "]";
+  WiFi.scanDelete();
+  server.send(200, "application/json", json);
+}
+
+void handleConnect()
+{
+  if (!server.hasArg("ssid") || server.arg("ssid").length() == 0)
+  {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing ssid\"}");
     return;
   }
 
-  static bool printedInfo = false;
-  if (!printedInfo)
-  {
-    Serial.printf("實際擷取畫面: %dx%d, format=%d, len=%d\n", fb->width, fb->height, fb->format, fb->len);
-    printedInfo = true;
-  }
+  String ssid = server.arg("ssid");
+  String password = server.hasArg("password") ? server.arg("password") : "";
 
-  if (fb->format == PIXFORMAT_RGB565)
-  {
-    // 相機實際協商出的解析度不一定剛好是 240x240，置中顯示避免因尺寸不符而整張跳過
-    int16_t x = (TFT_WIDTH - fb->width) / 2;
-    int16_t y = (TFT_HEIGHT - fb->height) / 2;
-    tft.startWrite();
-    tft.setAddrWindow(x, y, fb->width, fb->height);
-    tft.pushPixels((uint16_t *)fb->buf, fb->len / 2);
-    tft.endWrite();
-  }
+  wifiPrefs.begin(WIFI_PREF_NAMESPACE, false);
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("password", password);
+  wifiPrefs.end();
 
-  esp_camera_fb_return(fb);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  staConnecting = true;
+  staConnectStart = millis();
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStatus()
+{
+  bool connected = WiFi.status() == WL_CONNECTED;
+  String json = "{";
+  json += "\"connected\":" + String(connected ? "true" : "false");
+  json += ",\"connecting\":" + String(staConnecting ? "true" : "false");
+  json += ",\"ip\":\"" + (connected ? WiFi.localIP().toString() : String("")) + "\"";
+  json += ",\"ssid\":\"" + jsonEscape(connected ? WiFi.SSID() : String("")) + "\"";
+  json += ",\"led\":" + String(ledState ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleLed()
+{
+  if (server.hasArg("state"))
+  {
+    String s = server.arg("state");
+    ledState = (s == "1" || s == "true");
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+  }
+  server.send(200, "application/json", String("{\"led\":") + (ledState ? "true" : "false") + "}");
+}
+
+void tryAutoConnectSavedWifi()
+{
+  wifiPrefs.begin(WIFI_PREF_NAMESPACE, true);
+  String ssid = wifiPrefs.getString("ssid", "");
+  String password = wifiPrefs.getString("password", "");
+  wifiPrefs.end();
+
+  if (ssid.length() > 0)
+  {
+    Serial.print("嘗試自動連線已儲存的 Wi-Fi: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    staConnecting = true;
+    staConnectStart = millis();
+  }
 }
