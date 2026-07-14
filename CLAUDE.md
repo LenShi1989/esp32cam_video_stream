@@ -59,16 +59,24 @@ Setup24_ST7789.h 設定
 
 ## esp32cam 連接st7789 做影像傳輸
 
-使用 SPIFFS Web Server（實作於 `video_tx_rx/video_tx_rx.ino`，網頁檔在 `video_tx_rx/data/index.html`）：
+使用 SPIFFS Web Server（實作於 `video_tx_rx/video_tx_rx.ino`，
+網頁檔拆分為 `video_tx_rx/data/` 下的 `index.html`（結構）、`style.css`（樣式）、`app.js`（邏輯））：
 
 - ESP32 開 AP
   - SSID：`esp32_init`（開放網路，無密碼）
-- 設定 Wi-Fi 連線
-  - 掃描附近 SSID（GET `/scan`）
-  - 輸入 SSID + PASSWORD 送出連線（POST `/connect`，同時存入 NVS，下次開機自動嘗試重連）
-- 連線成功
-  - 網頁切換為一顆開關，控制 GPIO4 LED 亮滅（GET `/led?state=0|1`）
-  - GPIO4 為 AI-Thinker 板載強光 LED，未使用 microSD 卡時與相機、TFT 腳位皆不衝突
+- 網頁為科技風深色介面，側邊欄分四個頁面：
+  - 控制台：系統狀態（連線 / IP / 相機）+ GPIO4 燈光按鍵（GET `/led?state=0|1`）
+    - GPIO4 為 AI-Thinker 板載強光 LED，未使用 microSD 卡時與相機、TFT 腳位皆不衝突
+  - Wi-Fi 設定：
+    - 掃描附近 SSID（GET `/scan`）
+    - 輸入 SSID + PASSWORD 送出連線（POST `/connect`，同時存入 NVS，下次開機自動嘗試重連）
+    - 清除 SSID 按鍵（POST `/clear`，清除 NVS 設定並斷開 STA，熱點保持開啟可重新設定）
+  - 影像串流：瀏覽器輪詢 GET `/capture`（相機任務將 RGB565 幀以 frame2jpg 轉 JPEG 快照回傳）顯示即時影像
+  - 移動偵測：在影像上拖曳框選偵測區域，瀏覽器端做畫格差異比對；綠框 = 正常、紅框 = 已觸發，附靈敏度調整
+  - OTA 更新：上傳 .bin 無線更新（POST `/update?target=firmware|spiffs`，使用 Update.h）
+    - target=firmware：韌體 .bin（Arduino IDE「Sketch > Export Compiled Binary」）
+    - target=spiffs：SPIFFS 映像檔（mkspiffs 打包 `data` 資料夾），可免拉線更新網頁
+    - 更新期間相機任務暫停（flash 寫入會關閉 cache），完成後自動重新啟動
 
 核心分工：
 
@@ -78,5 +86,6 @@ Setup24_ST7789.h 設定
 燒錄注意事項：
 
 - Partition Scheme 需選含 SPIFFS 的方案（`.vscode/arduino.json` 已設為 `min_spiffs`）
-- `video_tx_rx/data/index.html` 需另外上傳到 SPIFFS，才能讓 `/` 網頁正常顯示
-  （例如使用 Arduino IDE 的 ESP32 Sketch Data Upload 外掛，或 arduino-cli + mkspiffs/esptool 燒錄 `data` 資料夾）
+- `video_tx_rx/data/` 內的 `index.html`、`style.css`、`app.js` 需一併上傳到 SPIFFS，才能讓 `/` 網頁正常顯示
+  （例如使用 Arduino IDE 的 ESP32 Sketch Data Upload 外掛，或 arduino-cli + mkspiffs/esptool 燒錄 `data` 資料夾；
+  之後也可從網頁「OTA 更新」頁面上傳 SPIFFS 映像檔免拉線更新）

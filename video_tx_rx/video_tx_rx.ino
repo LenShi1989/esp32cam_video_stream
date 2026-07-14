@@ -41,6 +41,8 @@
 #include <WebServer.h>
 #include <SPIFFS.h>
 #include <Preferences.h>
+#include <Update.h> // OTA：網頁上傳 .bin 更新韌體 / SPIFFS
+#include "img_converters.h" // frame2jpg：RGB565 -> JPEG，供網頁快照串流使用
 
 // ---------- TFT 顯示尺寸 ----------
 #define TFT_WIDTH 240
@@ -78,6 +80,23 @@ volatile bool ledState = false;
 bool staConnecting = false;
 unsigned long staConnectStart = 0;
 
+// ---------- 網頁影像快照 (core0 編碼 JPEG -> core1 回傳) ----------
+// WebServer 是單執行緒且相機由 core 0 獨占，因此用「請求/完成」握手：
+// /capture 先設 jpegRequested，相機任務在推完 TFT 後將該幀轉成 JPEG
+// 放進共用緩衝區並發出 jpegReadySem，core 1 再把緩衝區送給瀏覽器。
+volatile bool cameraOk = false;
+volatile bool jpegRequested = false;
+uint8_t *jpegBuf = NULL;
+size_t jpegLen = 0;
+SemaphoreHandle_t jpegMutex;
+SemaphoreHandle_t jpegReadySem;
+
+// ---------- OTA 更新 ----------
+// OTA 寫入 flash 時會暫時關閉 flash cache，為避免 core 0 的相機/TFT
+// 任務在此期間存取 flash 造成當機或畫面異常，更新中先讓相機任務暫停。
+volatile bool otaInProgress = false;
+bool otaSuccess = false;
+
 static bool initCamera();
 void cameraTask(void *param);
 String jsonEscape(const String &s);
@@ -86,6 +105,10 @@ void handleScan();
 void handleConnect();
 void handleStatus();
 void handleLed();
+void handleCapture();
+void handleClearWifi();
+void handleUpdateFinished();
+void handleUpdateUpload();
 void tryAutoConnectSavedWifi();
 
 // ================= setup / loop：core 1 = Web Server =================
@@ -121,11 +144,19 @@ void setup()
 
   tryAutoConnectSavedWifi();
 
+  jpegMutex = xSemaphoreCreateMutex();
+  jpegReadySem = xSemaphoreCreateBinary();
+
   server.on("/", HTTP_GET, handleRoot);
+  server.serveStatic("/style.css", SPIFFS, "/style.css");
+  server.serveStatic("/app.js", SPIFFS, "/app.js");
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/connect", HTTP_POST, handleConnect);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/led", HTTP_GET, handleLed);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/clear", HTTP_POST, handleClearWifi);
+  server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   server.begin();
   Serial.println("Web Server 已啟動 (core 1)");
 
@@ -170,10 +201,18 @@ void cameraTask(void *param)
   }
 
   Serial.println("相機初始化完成，開始串流 (core 0)");
+  cameraOk = true;
 
   bool printedInfo = false;
   for (;;)
   {
+    if (otaInProgress)
+    {
+      // OTA 寫入 flash 期間暫停擷取/顯示，降低 cache 關閉造成的風險
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb)
     {
@@ -196,6 +235,27 @@ void cameraTask(void *param)
       tft.setAddrWindow(x, y, fb->width, fb->height);
       tft.pushPixels((uint16_t *)fb->buf, fb->len / 2);
       tft.endWrite();
+    }
+
+    // 網頁 /capture 有人在等快照時，才把這一幀轉成 JPEG (約數十 ms)，
+    // 平常不編碼以免拖慢 TFT 串流
+    if (jpegRequested)
+    {
+      jpegRequested = false;
+      uint8_t *out = NULL;
+      size_t outLen = 0;
+      if (frame2jpg(fb, 80, &out, &outLen))
+      {
+        xSemaphoreTake(jpegMutex, portMAX_DELAY);
+        if (jpegBuf)
+        {
+          free(jpegBuf);
+        }
+        jpegBuf = out;
+        jpegLen = outLen;
+        xSemaphoreGive(jpegMutex);
+        xSemaphoreGive(jpegReadySem);
+      }
     }
 
     esp_camera_fb_return(fb);
@@ -329,8 +389,119 @@ void handleStatus()
   json += ",\"ip\":\"" + (connected ? WiFi.localIP().toString() : String("")) + "\"";
   json += ",\"ssid\":\"" + jsonEscape(connected ? WiFi.SSID() : String("")) + "\"";
   json += ",\"led\":" + String(ledState ? "true" : "false");
+  json += ",\"camera\":" + String(cameraOk ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
+}
+
+void handleCapture()
+{
+  if (!cameraOk)
+  {
+    server.send(503, "application/json", "{\"error\":\"camera not ready\"}");
+    return;
+  }
+
+  // 清掉前一次逾時可能殘留的 ready 訊號，再向相機任務要一張新的快照
+  while (xSemaphoreTake(jpegReadySem, 0) == pdTRUE)
+  {
+  }
+  jpegRequested = true;
+
+  if (xSemaphoreTake(jpegReadySem, pdMS_TO_TICKS(1500)) != pdTRUE)
+  {
+    server.send(503, "application/json", "{\"error\":\"capture timeout\"}");
+    return;
+  }
+
+  xSemaphoreTake(jpegMutex, portMAX_DELAY);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "image/jpeg", (const char *)jpegBuf, jpegLen);
+  xSemaphoreGive(jpegMutex);
+}
+
+void handleClearWifi()
+{
+  wifiPrefs.begin(WIFI_PREF_NAMESPACE, false);
+  wifiPrefs.clear();
+  wifiPrefs.end();
+
+  staConnecting = false;
+  // 只斷開 STA 並清除 WiFi 函式庫內部記住的 AP 資訊，softAP (esp32_init) 保持運作，
+  // 使用者可繼續連著熱點重新掃描/設定 Wi-Fi
+  WiFi.disconnect(false, true);
+  Serial.println("已清除儲存的 Wi-Fi 設定並斷線");
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// 上傳結束後回覆結果；成功則重新啟動套用新韌體/新網頁資料
+void handleUpdateFinished()
+{
+  server.sendHeader("Connection", "close");
+  if (otaSuccess)
+  {
+    server.send(200, "application/json", "{\"ok\":true}");
+    Serial.println("OTA 更新完成，重新啟動...");
+    delay(500); // 給 WebServer 一點時間把回應送出去
+    ESP.restart();
+  }
+  else
+  {
+    String err = Update.errorString();
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(err) + "\"}");
+    otaInProgress = false; // 更新失敗，恢復相機串流
+  }
+}
+
+// 分段接收上傳的 .bin：/update?target=firmware 寫入 OTA app 分割區，
+// /update?target=spiffs 寫入 SPIFFS 分割區 (整包 spiffs 映像檔)
+void handleUpdateUpload()
+{
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    otaInProgress = true;
+    otaSuccess = false;
+
+    bool isSpiffs = server.hasArg("target") && server.arg("target") == "spiffs";
+    Serial.printf("OTA 開始: %s (%s)\n", upload.filename.c_str(), isSpiffs ? "SPIFFS" : "firmware");
+
+    if (isSpiffs)
+    {
+      SPIFFS.end(); // 先卸載，避免更新途中還有檔案存取
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, isSpiffs ? U_SPIFFS : U_FLASH))
+    {
+      Update.printError(Serial);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+    {
+      Update.printError(Serial);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END)
+  {
+    if (Update.end(true))
+    {
+      otaSuccess = true;
+      Serial.printf("OTA 寫入完成，共 %u bytes\n", upload.totalSize);
+    }
+    else
+    {
+      Update.printError(Serial);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    Update.abort();
+    otaInProgress = false;
+    Serial.println("OTA 已中斷");
+  }
 }
 
 void handleLed()
