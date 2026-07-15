@@ -150,9 +150,12 @@ AI-Thinker 板載 microSD 與 ST7789 共用腳位（SD_MMC 1-bit 需 GPIO14/15/2
    - `-b 4096 -p 256` 為 ESP32 SPIFFS 預設 block/page 大小，不可更改
    - 輸出的 `spiffs.bin` 請放在 `data/` 之外（如上指令放在 `video_tx_rx/`），
      否則下次打包會把映像檔本身也包進去
+
 2. 瀏覽器連上 ESP32：連熱點 `esp32_init` 開 `http://192.168.4.1`，或用 STA 模式取得的 IP
 3. 側邊欄「OTA 更新」→ 更新目標選「SPIFFS 網頁資料」→ 選擇 `spiffs.bin` → 開始更新
 4. 上傳完成後裝置自動重新啟動，網頁約 10 秒後自動重新整理，即載入新版網頁
 
 > 注意：`spiffs.bin` 是整包映像檔，上傳會覆蓋 SPIFFS 分割區全部內容，
 > 打包時 `data/` 內必須包含完整的三個網頁檔，缺檔會導致對應頁面載入失敗。
+
+新增連接上wifi ap時自動開啟瀏覽器功能
