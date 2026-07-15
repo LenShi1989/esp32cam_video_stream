@@ -5,6 +5,7 @@ const VIEW_TITLES = {
   stream: "影像串流",
   motion: "移動偵測",
   alarm: "告警紀錄",
+  playback: "錄影回放",
   ota: "OTA 更新",
 };
 let currentView = "console";
@@ -22,6 +23,8 @@ document.querySelectorAll(".nav-item").forEach((item) => {
       );
     document.getElementById("viewTitle").textContent = VIEW_TITLES[currentView];
     if (currentView === "alarm") loadAlarms();
+    if (currentView === "playback") loadRecordings();
+    else stopPlayback(); // 離開回放頁即停止串流下載
   });
 });
 
@@ -44,7 +47,9 @@ let ledSyncing = false;
 function setLedUI(on) {
   ledState = on;
   ledBtn.classList.toggle("on", on);
+  ledBtn.setAttribute("aria-checked", on ? "true" : "false");
   ledBtnText.textContent = on ? "ON" : "OFF";
+  ledBtnText.style.color = on ? "var(--ok)" : "";
 }
 
 async function refreshStatus() {
@@ -448,9 +453,12 @@ async function pollMotion() {
 
     deviceTriggered = !!d.triggered;
     if (d.enabled) {
-      motionHud.textContent = "DIFF " + Number(d.diff).toFixed(1) + "%";
+      const recTag = d.recording ? " · 錄影中" : "";
+      motionHud.textContent =
+        "DIFF " + Number(d.diff).toFixed(1) + "%" + (d.recording ? " REC" : "");
       motionBadge.className = deviceTriggered ? "badge alert" : "badge normal";
-      motionBadge.textContent = deviceTriggered ? "偵測到移動" : "監控中";
+      motionBadge.textContent =
+        (deviceTriggered ? "偵測到移動" : "監控中") + recTag;
     } else {
       motionBadge.className = "badge";
       motionBadge.textContent = "未設定區域";
@@ -643,6 +651,179 @@ function beep() {
     /* 瀏覽器可能在使用者互動前禁止播放音效 */
   }
 }
+
+// ================= 錄影回放 =================
+const recListEl = document.getElementById("recListEl");
+const recCanvas = document.getElementById("recCanvas");
+const recCtx = recCanvas.getContext("2d");
+const recHud = document.getElementById("recHud");
+const recStatus = document.getElementById("recStatus");
+const recStopBtn = document.getElementById("recStopBtn");
+const recRefreshBtn = document.getElementById("recRefreshBtn");
+
+let playbackActive = false;
+let playbackAbort = null;
+
+// 檔名 20260716_143005_.avi -> 2026-07-16 14:30:05
+function recNameToTime(name) {
+  const m = name.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_/);
+  if (!m) return name;
+  return m[1] + "-" + m[2] + "-" + m[3] + " " + m[4] + ":" + m[5] + ":" + m[6];
+}
+
+async function loadRecordings() {
+  try {
+    const res = await fetch("/recordings");
+    const list = await res.json();
+    list.sort((a, b) => (a.name < b.name ? 1 : -1)); // 檔名含日期時間，新到舊
+    recListEl.innerHTML = "";
+    if (!list.length) {
+      recListEl.innerHTML =
+        '<p class="muted" style="margin:0">SD 卡沒有錄影檔（或目前為 TFT 模式）</p>';
+      return;
+    }
+    list.forEach((r) => {
+      const item = document.createElement("div");
+      item.className = "alarm-item";
+
+      const info = document.createElement("div");
+      info.className = "alarm-info";
+      const timeEl = document.createElement("span");
+      timeEl.className = "alarm-time";
+      timeEl.textContent = recNameToTime(r.name);
+      const metaEl = document.createElement("span");
+      metaEl.className = "muted";
+      metaEl.textContent = r.name + " · " + (r.size / 1048576).toFixed(1) + " MB";
+      info.append(timeEl, metaEl);
+
+      const btns = document.createElement("div");
+      btns.style.cssText = "display:flex;gap:8px;margin-left:auto;flex:none";
+      const playBtn = document.createElement("button");
+      playBtn.textContent = "播放";
+      playBtn.addEventListener("click", () => playRecording(r.name));
+      const delBtn = document.createElement("button");
+      delBtn.className = "danger";
+      delBtn.textContent = "刪除";
+      delBtn.addEventListener("click", async () => {
+        if (!confirm("確定要刪除 " + r.name + "？")) return;
+        try {
+          const res2 = await fetch(
+            "/rec/delete?name=" + encodeURIComponent(r.name),
+            { method: "POST" },
+          );
+          const d = await res2.json();
+          if (!d.ok) alert(d.error || "刪除失敗");
+        } catch (e) {
+          /* 重新整理列表會反映實際結果 */
+        }
+        loadRecordings();
+      });
+      btns.append(playBtn, delBtn);
+
+      item.append(info, btns);
+      recListEl.appendChild(item);
+    });
+  } catch (e) {
+    recListEl.innerHTML =
+      '<p class="muted" style="margin:0">讀取錄影清單失敗</p>';
+  }
+}
+
+function stopPlayback() {
+  playbackActive = false;
+  if (playbackAbort) {
+    playbackAbort.abort();
+    playbackAbort = null;
+  }
+  recHud.textContent = "IDLE";
+}
+
+function findSeq(arr, seq, from) {
+  outer: for (let i = from; i <= arr.length - seq.length; i++) {
+    for (let j = 0; j < seq.length; j++) {
+      if (arr[i + j] !== seq[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// 串流下載 AVI 並掃描其中的 JPEG 幀 (FFD8FF ~ FFD9)，以 10fps 步調繪到畫布。
+// 不解析 AVI 結構，MJPEG 每幀就是完整 JPEG，直接找標記最簡單可靠。
+async function playRecording(name) {
+  stopPlayback();
+  playbackActive = true;
+  playbackAbort = new AbortController();
+  recStatus.textContent = "載入中：" + name;
+  recHud.textContent = "PLAY 0.0s";
+  recCtx.clearRect(0, 0, recCanvas.width, recCanvas.height);
+
+  const SOI = [0xff, 0xd8, 0xff];
+  const EOI = [0xff, 0xd9];
+  let frames = 0;
+  try {
+    const res = await fetch("/rec/file?name=" + encodeURIComponent(name), {
+      signal: playbackAbort.signal,
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const reader = res.body.getReader();
+    let buf = new Uint8Array(0);
+    let next = performance.now();
+    while (playbackActive) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const nb = new Uint8Array(buf.length + value.length);
+      nb.set(buf);
+      nb.set(value, buf.length);
+      buf = nb;
+
+      for (;;) {
+        const s = findSeq(buf, SOI, 0);
+        if (s < 0) {
+          if (buf.length > 2) buf = buf.slice(buf.length - 2); // 保留可能截斷的標記
+          break;
+        }
+        const e = findSeq(buf, EOI, s + 3);
+        if (e < 0) {
+          if (s > 0) buf = buf.slice(s);
+          break;
+        }
+        const jpg = buf.slice(s, e + 2);
+        buf = buf.slice(e + 2);
+        const bmp = await createImageBitmap(
+          new Blob([jpg], { type: "image/jpeg" }),
+        ).catch(() => null);
+        if (bmp) {
+          const wait = next - performance.now();
+          if (wait > 0) await new Promise((r2) => setTimeout(r2, wait));
+          next = Math.max(next + 100, performance.now() - 200); // 10fps
+          drawRotated(recCtx, bmp, recCanvas.width, recCanvas.height);
+          bmp.close();
+          frames++;
+          recHud.textContent = "PLAY " + (frames / 10).toFixed(1) + "s";
+        }
+        if (!playbackActive) break;
+      }
+    }
+    if (playbackActive) {
+      recStatus.textContent =
+        "播放完畢：" + name + "（" + (frames / 10).toFixed(1) + " 秒）";
+      recHud.textContent = "END";
+    }
+  } catch (e) {
+    if (playbackActive) {
+      recStatus.textContent = "播放失敗：" + name;
+      recHud.textContent = "ERROR";
+    }
+  }
+  playbackActive = false;
+}
+
+recStopBtn.addEventListener("click", () => {
+  stopPlayback();
+  recStatus.textContent = "已停止播放";
+});
+recRefreshBtn.addEventListener("click", loadRecordings);
 
 // ================= OTA 更新 =================
 const otaFile = document.getElementById("otaFile");

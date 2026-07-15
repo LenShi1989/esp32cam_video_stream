@@ -65,8 +65,8 @@ Setup24_ST7789.h 設定
 - ESP32 開 AP
   - SSID：`esp32_init`（開放網路，無密碼）
 - 網頁為科技風深色介面，側邊欄分四個頁面：
-  - 控制台：系統狀態（連線 / IP / 相機）+ GPIO4 燈光按鍵（GET `/led?state=0|1`）
-    - GPIO4 為 AI-Thinker 板載強光 LED，未使用 microSD 卡時與相機、TFT 腳位皆不衝突
+  - 控制台：系統狀態（連線 / IP / 相機 / 資料儲存模式）+ GPIO4 燈光滑動開關 switch（GET `/led?state=0|1`）
+    - GPIO4 為 AI-Thinker 板載強光 LED；TFT 模式不衝突，SD 模式 1-bit 也不占用 GPIO4
   - Wi-Fi 設定：
     - 掃描附近 SSID（GET `/scan`）
     - 輸入 SSID + PASSWORD 送出連線（POST `/connect`，同時存入 NVS，下次開機自動嘗試重連）
@@ -86,6 +86,15 @@ Setup24_ST7789.h 設定
       - 訊息時間使用瀏覽器 POST `/time` 同步的 epoch + 時區 (tz 分鐘)
     - ST7789 同步顯示：TFT 串流畫面每幀疊加偵測框（綠 = 監控、紅 = 觸發，與網頁一致），
       觸發時右上角顯示黃色小鈴鐺（用 TFT 基本圖形拼出，觸發保持 1.5 秒）
+  - 觸發錄影（SD 模式限定）：告警成立時自動錄影 2 分鐘後停止
+    - 格式為 MJPEG-AVI（ESP32 無 H.264 硬體編碼器，做不出真正的 .mp4），10fps，約 15~18MB/段
+    - 檔名 `日期_時間_.avi`（如 `20260716_143005_.avi`，時間未同步時為 `notime_開機秒數_.avi`），存於 SD 卡 `/rec`
+    - 由 cameraTask (core 0) 逐幀 frame2jpg 寫入，結束時回填 AVI 檔頭與 idx1 索引；
+      錄影中再次觸發忽略；SD 剩餘空間 < 32MB 時略過；OTA 開始時先收尾關檔
+  - 錄影回放（側邊欄頁面）：列出 `/rec` 錄影檔（GET `/recordings`），網頁播放器以串流方式下載
+    （GET `/rec/file?name=`，分塊讀取避免卡住錄影寫入）並掃描 JPEG 幀（FFD8~FFD9）繪至 canvas，
+    10fps 播放、支援目前旋轉角度；可刪除檔案（POST `/rec/delete?name=`，錄影中禁止刪除）；
+    檔案亦可取出 SD 卡用電腦播放（VLC 等）
   - 告警紀錄：移動偵測觸發時韌體自動以 frame2jpg 擷取當下畫面
     - 每筆紀錄含觸發時間 + 觸發擷取圖片；儲存位置依儲存模式而定（見下方「資料儲存模式」）
     - 兩筆告警最小間隔 5 秒，避免連續移動灌爆紀錄

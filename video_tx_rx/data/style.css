@@ -353,33 +353,57 @@ ul.nets li.selected {
   color: var(--err);
 }
 
-/* LED 開關 */
-.led-btn {
-  width: 120px;
-  height: 120px;
-  border-radius: 50%;
-  border: 2px solid var(--line);
-  background: #0a101d;
-  color: var(--muted);
-  font-size: 14px;
-  letter-spacing: 2px;
+/* GPIO4 LED switch 滑動開關 */
+.switch-row {
   display: flex;
-  flex-direction: column;
+  justify-content: space-between;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  margin: 10px auto;
+  gap: 12px;
+  padding: 14px 4px;
+  font-size: 14px;
 }
-.led-btn .big {
-  font-size: 26px;
+.switch {
+  position: relative;
+  width: 62px;
+  height: 30px;
+  flex: none;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #0a101d;
+  padding: 0;
+  cursor: pointer;
+  transition: all 0.2s;
 }
-.led-btn.on {
+.switch .knob {
+  position: absolute;
+  top: 3px;
+  left: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: all 0.2s;
+}
+.switch:hover {
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.25);
+}
+.switch.on {
   border-color: var(--ok);
-  color: var(--ok);
+  background: rgba(43, 255, 136, 0.12);
   box-shadow:
-    0 0 24px rgba(43, 255, 136, 0.45),
-    inset 0 0 24px rgba(43, 255, 136, 0.12);
-  text-shadow: 0 0 10px rgba(43, 255, 136, 0.8);
+    0 0 12px rgba(43, 255, 136, 0.35),
+    inset 0 0 10px rgba(43, 255, 136, 0.1);
+}
+.switch.on .knob {
+  left: 34px;
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+}
+.switch-state {
+  font-family: Consolas, monospace;
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 28px;
 }
 
 /* 影像/偵測畫布 */

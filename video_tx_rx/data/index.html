@@ -25,6 +25,9 @@
         <span class="ico">⚠</span>告警紀錄
         <span id="alarmNavBadge" class="nav-badge" hidden>0</span>
       </div>
+      <div class="nav-item" data-view="playback">
+        <span class="ico">▤</span>錄影回放
+      </div>
       <div class="nav-item" data-view="ota">
         <span class="ico">⇪</span>OTA 更新
       </div>
@@ -70,11 +73,23 @@
         </div>
         <div class="card">
           <h2>GPIO4 燈光控制</h2>
-          <button id="ledBtn" class="led-btn" type="button">
-            <span class="big">⏻</span><span id="ledBtnText">OFF</span>
-          </button>
-          <p class="muted" style="text-align: center; margin: 4px 0 0">
-            AI-Thinker 板載強光 LED
+          <div class="switch-row">
+            <span>板載強光 LED</span>
+            <div style="display: flex; align-items: center; gap: 12px">
+              <button
+                id="ledBtn"
+                class="switch"
+                type="button"
+                role="switch"
+                aria-checked="false"
+              >
+                <span class="knob"></span>
+              </button>
+              <span id="ledBtnText" class="switch-state">OFF</span>
+            </div>
+          </div>
+          <p class="muted" style="margin: 10px 0 0">
+            AI-Thinker 板載強光 LED (GPIO4)，開關狀態每 2 秒與裝置同步。
           </p>
         </div>
       </section>
@@ -214,6 +229,38 @@
             SD 模式（開機時插入 microSD）：存於 SD 卡 /alarms，保留最近 50
             筆，斷電保留；TFT 模式：存於裝置記憶體，保留最近 10
             筆，斷電或重新啟動後清空。
+          </p>
+        </div>
+      </section>
+
+      <!-- ========== 錄影回放 ========== -->
+      <section id="panel-playback" class="panel">
+        <div class="card" style="max-width: 520px">
+          <h2>播放器</h2>
+          <div class="view-wrap">
+            <div class="hud" id="recHud">IDLE</div>
+            <canvas id="recCanvas" width="240" height="240"></canvas>
+          </div>
+          <div class="toolbar">
+            <button id="recStopBtn" class="ghost" type="button">
+              停止播放
+            </button>
+            <span class="muted" id="recStatus">選擇下方錄影檔開始播放</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row" style="margin-bottom: 10px">
+            <h2 style="margin: 0">SD 卡錄影檔</h2>
+            <button id="recRefreshBtn" class="ghost" type="button">
+              重新整理
+            </button>
+          </div>
+          <div id="recListEl" class="alarm-list"></div>
+          <p class="muted" style="margin: 12px 0 0">
+            移動偵測觸發後自動錄影 2 分鐘（MJPEG-AVI，10fps，檔名
+            日期_時間_.avi），存於 SD 卡 /rec 資料夾，僅 SD
+            模式可用。檔案也可取出 SD 卡直接用電腦播放（VLC
+            等）。錄影進行中最新一筆檔案尚未完成，請等錄影結束再播放。
           </p>
         </div>
       </section>

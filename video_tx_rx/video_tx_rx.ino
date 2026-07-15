@@ -141,6 +141,28 @@ SemaphoreHandle_t sdMutex; // 序列化所有 SD 卡檔案存取 (FATFS 併發�
 String sdWifiSsid;         // SD 模式的 Wi-Fi 紀錄 (取代 NVS)
 String sdWifiPassword;
 
+// ---------- 移動偵測觸發錄影 (SD 模式，MJPEG-AVI) ----------
+// ESP32 沒有 H.264 硬體編碼器，無法產生真正的 .mp4；採用 ESP32-CAM 標準的
+// MJPEG-AVI (每幀 JPEG 包進 AVI 容器)，電腦可用 VLC 等直接播放，
+// 網頁「錄影回放」頁以串流解析 JPEG 幀方式播放。
+// 檔名：/rec/日期_時間_.avi (時間未同步時為 notime_開機秒數_.avi)
+#define REC_DIR "/rec"
+#define RECORD_SECONDS 120 // 觸發後錄影時長 2 分鐘
+#define RECORD_FPS 10
+#define RECORD_MAX_FRAMES (RECORD_SECONDS * RECORD_FPS)
+
+volatile bool recording = false;       // 錄影中 (網頁狀態顯示用)
+volatile bool recordRequested = false; // 偵測觸發 -> 相機迴圈開始錄影
+
+// 以下僅 cameraTask (core 0) 存取
+File recFile;
+String recPath;
+uint32_t recFrames = 0;
+uint32_t recMoviBytes = 0;  // AVI movi 區塊大小 (含 'movi' fourcc)
+uint32_t recStartMs = 0;
+uint32_t recNextFrameMs = 0;
+uint32_t *recIdx = NULL;    // idx1 索引 [offset,size] * RECORD_MAX_FRAMES (PSRAM)
+
 // ---------- 告警紀錄 (觸發時間 + 觸發當下 JPEG) ----------
 // TFT 模式：JPEG 存 PSRAM 環形緩衝 (斷電消失，保留 10 筆)。
 // SD 模式：JPEG 寫入 /alarms/<id>.jpg + index.json (斷電保留，保留 50 筆)。
@@ -187,6 +209,13 @@ void saveAppSettings();
 void loadAlarmIndex();
 void saveAlarmIndexLocked();
 String alarmJpgPath(uint32_t id);
+bool startRecording();
+void stopRecording();
+void writeRecordingFrame(const uint8_t *jpg, size_t len);
+String recFilePath();
+void handleRecList();
+void handleRecFile();
+void handleRecDelete();
 String jsonEscape(const String &s);
 void handleNotifyConfigGet();
 void handleNotifyConfigSet();
@@ -294,6 +323,9 @@ void setup()
   server.on("/notify/config", HTTP_GET, handleNotifyConfigGet);
   server.on("/notify/config", HTTP_POST, handleNotifyConfigSet);
   server.on("/notify/test", HTTP_POST, handleNotifyTest);
+  server.on("/recordings", HTTP_GET, handleRecList);
+  server.on("/rec/file", HTTP_GET, handleRecFile);
+  server.on("/rec/delete", HTTP_POST, handleRecDelete);
   server.on("/time", HTTP_POST, handleTimeSync);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   server.begin();
@@ -356,6 +388,10 @@ void cameraTask(void *param)
   {
     if (otaInProgress)
     {
+      if (recording)
+      {
+        stopRecording(); // 先收尾寫入索引與檔頭，避免留下毀損檔
+      }
       // OTA 寫入 flash 期間暫停擷取/顯示，降低 cache 關閉造成的風險
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
@@ -394,6 +430,39 @@ void cameraTask(void *param)
       {
         // 疊加偵測框 (綠=監控/紅=觸發) 與觸發鈴鐺；下一幀影像會蓋掉重畫
         drawMotionOverlayOnTft(x, y);
+      }
+
+      // ---------- 觸發錄影 (SD 模式) ----------
+      if (sdMode)
+      {
+        if (recordRequested && !recording)
+        {
+          recordRequested = false;
+          startRecording();
+        }
+        if (recording)
+        {
+          uint32_t nowMs = millis();
+          if (nowMs - recStartMs >= RECORD_SECONDS * 1000UL || recFrames >= RECORD_MAX_FRAMES)
+          {
+            stopRecording();
+          }
+          else if ((int32_t)(nowMs - recNextFrameMs) >= 0)
+          {
+            recNextFrameMs += 1000 / RECORD_FPS;
+            if ((int32_t)(nowMs - recNextFrameMs) > 1000)
+            {
+              recNextFrameMs = nowMs; // SD 寫入落後過多時重新對時
+            }
+            uint8_t *out = NULL;
+            size_t outLen = 0;
+            if (frame2jpg(fb, 80, &out, &outLen))
+            {
+              writeRecordingFrame(out, outLen);
+              free(out);
+            }
+          }
+        }
       }
     }
 
@@ -532,6 +601,10 @@ void detectMotionOnFrame(camera_fb_t *fb)
       {
         lastAlarmMs = millis();
         addAlarmRecord(fb);
+        if (sdMode && !recording)
+        {
+          recordRequested = true; // 觸發後錄影 2 分鐘 (錄影中再觸發則忽略)
+        }
       }
     }
   }
@@ -1027,6 +1100,190 @@ void saveAlarmIndexLocked()
   cJSON_free(text);
 }
 
+// ================= 觸發錄影：MJPEG-AVI 寫入 (core 0) =================
+
+static void wrLE32(uint8_t *p, uint32_t v)
+{
+  p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+static void wrLE16(uint8_t *p, uint16_t v)
+{
+  p[0] = v; p[1] = v >> 8;
+}
+static void wrFourcc(uint8_t *p, const char *s)
+{
+  memcpy(p, s, 4);
+}
+
+// 檔名：日期_時間_.avi (依瀏覽器同步的時區)；時間未同步用開機秒數
+String recFilePath()
+{
+  time_t now = time(NULL);
+  if (now < 1000000000)
+  {
+    return String(REC_DIR) + "/notime_" + String(millis() / 1000) + "_.avi";
+  }
+  time_t local = now + (time_t)tzOffsetMin * 60;
+  struct tm tmv;
+  gmtime_r(&local, &tmv);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S_", &tmv);
+  return String(REC_DIR) + "/" + buf + ".avi";
+}
+
+// 寫入 224 bytes AVI 檔頭 (RIFF/hdrl/movi)；幀數與大小先填 0，結束時回填。
+// 回填位置：riffSize@4、totalFrames@48、strh.length@140、moviSize@216，首幀@224
+bool startRecording()
+{
+  if (!recIdx)
+  {
+    recIdx = (uint32_t *)ps_malloc(RECORD_MAX_FRAMES * 2 * sizeof(uint32_t));
+    if (!recIdx)
+    {
+      Serial.println("錄影失敗：idx1 索引配置失敗");
+      return false;
+    }
+  }
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  uint64_t freeBytes = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+  if (freeBytes < 32ULL * 1024 * 1024) // 預估一段約 18MB，保留餘裕
+  {
+    xSemaphoreGive(sdMutex);
+    Serial.println("錄影略過：SD 卡剩餘空間不足 32MB");
+    return false;
+  }
+  SD_MMC.mkdir(REC_DIR);
+  recPath = recFilePath();
+  recFile = SD_MMC.open(recPath, FILE_WRITE);
+  if (!recFile)
+  {
+    xSemaphoreGive(sdMutex);
+    Serial.println("錄影失敗：無法建立檔案 " + recPath);
+    return false;
+  }
+
+  uint8_t hdr[224];
+  memset(hdr, 0, sizeof(hdr));
+  wrFourcc(hdr + 0, "RIFF");                    // riffSize @4 回填
+  wrFourcc(hdr + 8, "AVI ");
+  wrFourcc(hdr + 12, "LIST");
+  wrLE32(hdr + 16, 192);
+  wrFourcc(hdr + 20, "hdrl");
+  wrFourcc(hdr + 24, "avih");
+  wrLE32(hdr + 28, 56);
+  wrLE32(hdr + 32, 1000000 / RECORD_FPS);       // dwMicroSecPerFrame
+  wrLE32(hdr + 36, 400000);                     // dwMaxBytesPerSec (估)
+  wrLE32(hdr + 44, 0x10);                       // AVIF_HASINDEX
+  wrLE32(hdr + 56, 1);                          // dwStreams
+  wrLE32(hdr + 60, 32768);                      // dwSuggestedBufferSize
+  wrLE32(hdr + 64, TFT_WIDTH);
+  wrLE32(hdr + 68, TFT_HEIGHT);
+  wrFourcc(hdr + 88, "LIST");
+  wrLE32(hdr + 92, 116);
+  wrFourcc(hdr + 96, "strl");
+  wrFourcc(hdr + 100, "strh");
+  wrLE32(hdr + 104, 56);
+  wrFourcc(hdr + 108, "vids");
+  wrFourcc(hdr + 112, "MJPG");
+  wrLE32(hdr + 128, 1);                         // dwScale
+  wrLE32(hdr + 132, RECORD_FPS);                // dwRate -> fps
+  wrLE32(hdr + 144, 32768);                     // dwSuggestedBufferSize
+  wrLE16(hdr + 160, TFT_WIDTH);                 // rcFrame.right
+  wrLE16(hdr + 162, TFT_HEIGHT);                // rcFrame.bottom
+  wrFourcc(hdr + 164, "strf");
+  wrLE32(hdr + 168, 40);
+  wrLE32(hdr + 172, 40);                        // biSize
+  wrLE32(hdr + 176, TFT_WIDTH);
+  wrLE32(hdr + 180, TFT_HEIGHT);
+  wrLE16(hdr + 184, 1);                         // biPlanes
+  wrLE16(hdr + 186, 24);                        // biBitCount
+  wrFourcc(hdr + 188, "MJPG");                  // biCompression
+  wrLE32(hdr + 192, TFT_WIDTH * TFT_HEIGHT * 3);
+  wrFourcc(hdr + 212, "LIST");                  // moviSize @216 回填
+  wrFourcc(hdr + 220, "movi");
+  recFile.write(hdr, sizeof(hdr));
+  xSemaphoreGive(sdMutex);
+
+  recFrames = 0;
+  recMoviBytes = 4; // 'movi' fourcc
+  recStartMs = millis();
+  recNextFrameMs = recStartMs;
+  recording = true;
+  Serial.println("開始錄影: " + recPath);
+  return true;
+}
+
+// 追加一幀 '00dc' JPEG 區塊 (資料長度補齊為偶數)
+void writeRecordingFrame(const uint8_t *jpg, size_t len)
+{
+  if (!recording || recFrames >= RECORD_MAX_FRAMES)
+  {
+    return;
+  }
+  uint8_t chunkHdr[8];
+  wrFourcc(chunkHdr, "00dc");
+  wrLE32(chunkHdr + 4, len);
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  recFile.write(chunkHdr, 8);
+  recFile.write(jpg, len);
+  if (len & 1)
+  {
+    uint8_t pad = 0;
+    recFile.write(&pad, 1);
+  }
+  xSemaphoreGive(sdMutex);
+
+  recIdx[recFrames * 2] = recMoviBytes; // '00dc' 相對 'movi' fourcc 的位移
+  recIdx[recFrames * 2 + 1] = (uint32_t)len;
+  recMoviBytes += 8 + ((len + 1) & ~1UL);
+  recFrames++;
+}
+
+// 附上 idx1 索引、回填幀數與各區塊大小後關檔
+void stopRecording()
+{
+  if (!recording)
+  {
+    return;
+  }
+  recording = false;
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  uint8_t entry[16];
+  wrFourcc(entry, "idx1");
+  wrLE32(entry + 4, recFrames * 16);
+  recFile.write(entry, 8);
+  for (uint32_t i = 0; i < recFrames; i++)
+  {
+    wrFourcc(entry, "00dc");
+    wrLE32(entry + 4, 0x10); // AVIIF_KEYFRAME
+    wrLE32(entry + 8, recIdx[i * 2]);
+    wrLE32(entry + 12, recIdx[i * 2 + 1]);
+    recFile.write(entry, 16);
+  }
+  uint32_t fileSize = recFile.position();
+  uint8_t num[4];
+  recFile.seek(4);
+  wrLE32(num, fileSize - 8);
+  recFile.write(num, 4);
+  recFile.seek(48);
+  wrLE32(num, recFrames);
+  recFile.write(num, 4);
+  recFile.seek(140);
+  wrLE32(num, recFrames);
+  recFile.write(num, 4);
+  recFile.seek(216);
+  wrLE32(num, recMoviBytes);
+  recFile.write(num, 4);
+  recFile.close();
+  xSemaphoreGive(sdMutex);
+
+  Serial.printf("錄影完成: %s，%u 幀，%.1f 秒\n",
+                recPath.c_str(), recFrames, recFrames / (float)RECORD_FPS);
+}
+
 // ================= Web Server 處理函式 =================
 
 String jsonEscape(const String &s)
@@ -1218,6 +1475,7 @@ void handleMotionStatus()
   json += ",\"triggered\":" + String(triggered ? "true" : "false");
   json += ",\"lastId\":" + String(alarmLastId);
   json += ",\"count\":" + String(alarmCount);
+  json += ",\"recording\":" + String(recording ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1302,6 +1560,126 @@ void handleAlarmClear()
   }
   xSemaphoreGive(alarmMutex);
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---------- 錄影回放 ----------
+
+// 錄影檔清單 (檔名含日期時間，由網頁端解析排序)
+void handleRecList()
+{
+  if (!sdMode)
+  {
+    server.send(200, "application/json", "[]");
+    return;
+  }
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  String json = "[";
+  bool first = true;
+  File dir = SD_MMC.open(REC_DIR);
+  if (dir && dir.isDirectory())
+  {
+    File f;
+    while ((f = dir.openNextFile()))
+    {
+      String name = f.name();
+      if (!f.isDirectory() && name.endsWith(".avi"))
+      {
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String((uint32_t)f.size()) + "}";
+      }
+      f.close();
+    }
+  }
+  if (dir) dir.close();
+  json += "]";
+  xSemaphoreGive(sdMutex);
+  server.send(200, "application/json", json);
+}
+
+// 檢查檔名參數，防止路徑跳脫
+static bool validRecName(const String &name)
+{
+  return name.length() > 0 && name.indexOf("..") < 0 &&
+         name.indexOf('/') < 0 && name.indexOf('\\') < 0 && name.endsWith(".avi");
+}
+
+// 串流錄影檔。分塊讀取、每塊之間釋放 sdMutex，避免長時間下載
+// 卡死 core 0 的錄影寫入
+void handleRecFile()
+{
+  String name = server.arg("name");
+  if (!sdMode || !validRecName(name))
+  {
+    server.send(400, "application/json", "{\"error\":\"bad name\"}");
+    return;
+  }
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  File f = SD_MMC.open(String(REC_DIR) + "/" + name, FILE_READ);
+  size_t fsize = f ? f.size() : 0;
+  xSemaphoreGive(sdMutex);
+  if (!f)
+  {
+    server.send(404, "application/json", "{\"error\":\"not found\"}");
+    return;
+  }
+
+  const size_t BUF_SIZE = 4096;
+  uint8_t *buf = (uint8_t *)malloc(BUF_SIZE);
+  if (!buf)
+  {
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    f.close();
+    xSemaphoreGive(sdMutex);
+    server.send(500, "application/json", "{\"error\":\"no mem\"}");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(fsize);
+  server.send(200, "video/x-msvideo", "");
+  WiFiClient client = server.client();
+  size_t remaining = fsize;
+  while (remaining > 0 && client.connected())
+  {
+    size_t want = remaining < BUF_SIZE ? remaining : BUF_SIZE;
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    int r = f.read(buf, want);
+    xSemaphoreGive(sdMutex);
+    if (r <= 0)
+    {
+      break;
+    }
+    client.write(buf, r);
+    remaining -= r;
+  }
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  f.close();
+  xSemaphoreGive(sdMutex);
+  free(buf);
+}
+
+void handleRecDelete()
+{
+  String name = server.arg("name");
+  if (!sdMode || !validRecName(name))
+  {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad name\"}");
+    return;
+  }
+  if (recording)
+  {
+    // 錄影中的檔案還握在 core 0 手上，FATFS 刪除開啟中的檔案行為未定義
+    server.send(409, "application/json",
+                "{\"ok\":false,\"error\":\"錄影進行中，請稍後再刪除\"}");
+    return;
+  }
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  bool ok = SD_MMC.remove(String(REC_DIR) + "/" + name);
+  xSemaphoreGive(sdMutex);
+  server.send(200, "application/json",
+              ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"刪除失敗\"}");
 }
 
 // 網頁載入時 POST epoch=秒&tz=時區分鐘 同步時間 (AP 模式沒網路拿不到 NTP)
