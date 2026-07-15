@@ -483,4 +483,6 @@ $RECYCLE.BIN/
 
 # ESP32 打包/編譯產物 (mkspiffs 映像檔、Export Compiled Binary 輸出)
 spiffs.bin
+video_tx_rx.ino.esp32.bin
 video_tx_rx/build/
+
