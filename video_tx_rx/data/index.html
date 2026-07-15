@@ -170,6 +170,29 @@
             5 秒）。
           </p>
         </div>
+        <div class="card" style="max-width: 520px">
+          <h2>Discord 推播通知</h2>
+          <p class="muted" style="margin: 0">
+            觸發告警時將「時間 + 擷取影像」傳送到 Discord 頻道，手機安裝
+            Discord App 並開啟通知即可收到推播。需先在「Wi-Fi
+            設定」連上可上網的網路。Webhook 建立方式：Discord 頻道 &gt; 編輯頻道
+            &gt; 整合 &gt; Webhook。
+          </p>
+          <input
+            id="webhookInput"
+            type="text"
+            placeholder="https://discord.com/api/webhooks/..."
+          />
+          <div class="row" style="margin-top: 14px">
+            <div style="display: flex; gap: 10px">
+              <button id="webhookSaveBtn" type="button">儲存</button>
+              <button id="webhookTestBtn" class="ghost" type="button">
+                測試傳送
+              </button>
+            </div>
+            <span id="webhookMsg" class="msg"></span>
+          </div>
+        </div>
       </section>
 
       <!-- ========== 告警紀錄 ========== -->

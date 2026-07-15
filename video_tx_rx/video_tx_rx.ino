@@ -38,6 +38,8 @@
 #include <FS.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h> // Discord Webhook 推播通知
 #include <WebServer.h>
 #include <SPIFFS.h>
 #include <Preferences.h>
@@ -138,11 +140,30 @@ int alarmCount = 0;                 // 目前保存筆數 (<= MAX_ALARMS)
 volatile uint32_t alarmLastId = 0;  // 最新一筆 id，網頁輪詢比對用
 SemaphoreHandle_t alarmMutex;
 
+// ---------- Discord 推播通知 ----------
+// 告警觸發時把「時間 + 擷取圖片」POST 到 Discord Webhook，手機裝 Discord App
+// 即可收到推播。需 STA 連上可上網的 Wi-Fi。傳送由獨立任務處理 (TLS 握手
+// 需數秒)，避免卡住相機任務或 WebServer。
+#define NOTIFY_PREF_NAMESPACE "notify"
+Preferences notifyPrefs;
+String discordWebhook;            // 空字串 = 未設定/停用
+SemaphoreHandle_t notifyMutex;    // 保護 discordWebhook 跨任務存取
+QueueHandle_t notifyQueue;        // 待推播的告警 id (0 = 測試訊息)
+volatile int tzOffsetMin = 0;     // 瀏覽器時區 (分鐘，UTC+8 = 480)，供訊息時間顯示
+
 static bool initCamera();
 void cameraTask(void *param);
 void detectMotionOnFrame(camera_fb_t *fb);
 void addAlarmRecord(camera_fb_t *fb);
+void drawMotionOverlayOnTft(int16_t xoff, int16_t yoff);
+void drawBellIcon(int16_t cx, int16_t cy);
+void notifyTask(void *param);
+void sendDiscordNotify(uint32_t alarmId);
+String formatEpoch(time_t epoch);
 String jsonEscape(const String &s);
+void handleNotifyConfigGet();
+void handleNotifyConfigSet();
+void handleNotifyTest();
 void handleRoot();
 void handleScan();
 void handleConnect();
@@ -197,6 +218,17 @@ void setup()
   jpegReadySem = xSemaphoreCreateBinary();
   motionCfgMutex = xSemaphoreCreateMutex();
   alarmMutex = xSemaphoreCreateMutex();
+  notifyMutex = xSemaphoreCreateMutex();
+  notifyQueue = xQueueCreate(5, sizeof(uint32_t));
+
+  // 讀取已儲存的 Discord Webhook
+  notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, true);
+  discordWebhook = notifyPrefs.getString("webhook", "");
+  notifyPrefs.end();
+  if (discordWebhook.length() > 0)
+  {
+    Serial.println("Discord 推播已設定");
+  }
 
   server.on("/", HTTP_GET, handleRoot);
   server.serveStatic("/style.css", SPIFFS, "/style.css");
@@ -212,6 +244,9 @@ void setup()
   server.on("/alarms", HTTP_GET, handleAlarmList);
   server.on("/alarm/img", HTTP_GET, handleAlarmImage);
   server.on("/alarm/clear", HTTP_POST, handleAlarmClear);
+  server.on("/notify/config", HTTP_GET, handleNotifyConfigGet);
+  server.on("/notify/config", HTTP_POST, handleNotifyConfigSet);
+  server.on("/notify/test", HTTP_POST, handleNotifyTest);
   server.on("/time", HTTP_POST, handleTimeSync);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   server.begin();
@@ -219,6 +254,8 @@ void setup()
 
   // 相機擷取 + TFT 顯示放到備用核心 (core 0)，避免與 Web Server 互相卡住
   xTaskCreatePinnedToCore(cameraTask, "cameraTask", 10240, NULL, 1, NULL, 0);
+  // Discord 推播任務放 core 1：TLS 握手耗時數秒，獨立任務不卡相機/WebServer
+  xTaskCreatePinnedToCore(notifyTask, "notifyTask", 8192, NULL, 1, NULL, 1);
 }
 
 void loop()
@@ -295,6 +332,9 @@ void cameraTask(void *param)
 
       // 移動偵測在裝置端逐幀進行，瀏覽器關掉也持續監控
       detectMotionOnFrame(fb);
+
+      // 疊加偵測框 (綠=監控/紅=觸發) 與觸發鈴鐺；下一幀影像會蓋掉重畫
+      drawMotionOverlayOnTft(x, y);
     }
 
     // 網頁 /capture 有人在等快照時，才把這一幀轉成 JPEG (約數十 ms)，
@@ -476,7 +516,182 @@ void addAlarmRecord(camera_fb_t *fb)
   if (alarmCount < MAX_ALARMS) alarmCount++;
   xSemaphoreGive(alarmMutex);
 
+  // 交給通知任務推播 Discord (佇列滿了就放棄這則，不能卡住相機任務)
+  if (notifyQueue)
+  {
+    xQueueSend(notifyQueue, &id, 0);
+  }
+
   Serial.printf("移動偵測告警 #%u，JPEG %u bytes\n", id, (unsigned)outLen);
+}
+
+// ---------- ST7789 疊加偵測框 / 觸發鈴鐺 (core 0，每幀重畫) ----------
+// 偵測框座標為感光元件座標；影像與圖形都經過 tft.setRotation 同一座標
+// 轉換，因此直接以相同座標繪製即可與畫面內容對齊。
+void drawMotionOverlayOnTft(int16_t xoff, int16_t yoff)
+{
+  xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
+  MotionConfig cfg = motionCfg;
+  xSemaphoreGive(motionCfgMutex);
+  if (!cfg.enabled)
+  {
+    return;
+  }
+
+  bool triggered = (int32_t)(motionTriggeredUntilMs - millis()) > 0;
+  uint16_t color = triggered ? TFT_RED : TFT_GREEN;
+  tft.drawRect(xoff + cfg.x, yoff + cfg.y, cfg.w, cfg.h, color);
+  // 內縮一圈加粗，串流畫面上比較醒目
+  tft.drawRect(xoff + cfg.x + 1, yoff + cfg.y + 1, cfg.w - 2, cfg.h - 2, color);
+
+  if (triggered)
+  {
+    drawBellIcon(TFT_WIDTH - 16, 16);
+  }
+}
+
+// 用基本圖形拼出約 20x22 的小鈴鐺 (cx, cy 為鐘身中心)
+void drawBellIcon(int16_t cx, int16_t cy)
+{
+  const uint16_t c = TFT_YELLOW;
+  tft.fillCircle(cx, cy - 8, 2, c);        // 頂部掛鈕
+  tft.fillCircle(cx, cy - 2, 7, c);        // 鐘頂圓弧
+  tft.fillRect(cx - 7, cy - 2, 15, 7, c);  // 鐘身
+  tft.fillRect(cx - 10, cy + 5, 21, 2, c); // 底部外擴邊
+  tft.fillCircle(cx, cy + 9, 2, c);        // 鈴舌
+}
+
+// ================= Discord 推播通知 (core 1 獨立任務) =================
+
+void notifyTask(void *param)
+{
+  for (;;)
+  {
+    uint32_t id;
+    if (xQueueReceive(notifyQueue, &id, portMAX_DELAY) == pdTRUE)
+    {
+      sendDiscordNotify(id);
+    }
+  }
+}
+
+// 依瀏覽器同步的時區把 epoch 格式化成當地時間字串
+String formatEpoch(time_t epoch)
+{
+  if (epoch < 1000000000)
+  {
+    return "時間未同步";
+  }
+  time_t local = epoch + (time_t)tzOffsetMin * 60;
+  struct tm tmv;
+  gmtime_r(&local, &tmv);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+  return String(buf);
+}
+
+// 以 multipart/form-data 把「時間 + 觸發擷取圖片」POST 到 Discord Webhook。
+// alarmId = 0 表示測試訊息 (不帶圖片)。
+void sendDiscordNotify(uint32_t alarmId)
+{
+  // OTA 期間讓出頻寬與記憶體，等更新結束再送
+  while (otaInProgress)
+  {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  String url = discordWebhook;
+  xSemaphoreGive(notifyMutex);
+  if (url.length() == 0)
+  {
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Discord 通知略過：STA 未連上可上網的 Wi-Fi");
+    return;
+  }
+
+  // 取出告警 JPEG 副本，避免傳送期間環形緩衝被覆蓋
+  uint8_t *jpg = NULL;
+  size_t jpgSize = 0;
+  time_t epoch = time(NULL);
+  if (alarmId != 0)
+  {
+    xSemaphoreTake(alarmMutex, portMAX_DELAY);
+    for (int i = 0; i < alarmCount; i++)
+    {
+      if (alarmList[i].id == alarmId && alarmList[i].jpg)
+      {
+        jpg = (uint8_t *)ps_malloc(alarmList[i].len);
+        if (jpg)
+        {
+          memcpy(jpg, alarmList[i].jpg, alarmList[i].len);
+          jpgSize = alarmList[i].len;
+          epoch = alarmList[i].epoch;
+        }
+        break;
+      }
+    }
+    xSemaphoreGive(alarmMutex);
+  }
+
+  String content = (alarmId != 0)
+                       ? "⚠️ ESP32-CAM 移動偵測告警 #" + String(alarmId)
+                       : "🔔 ESP32-CAM 測試通知";
+  String payload = "{\"content\":\"" + content + "\\n時間：" + formatEpoch(epoch) + "\"}";
+
+  const String boundary = "----Esp32CamAlarmBoundary";
+  String pre = "--" + boundary + "\r\n"
+               "Content-Disposition: form-data; name=\"payload_json\"\r\n"
+               "Content-Type: application/json\r\n\r\n" + payload;
+  String imgHead = "\r\n--" + boundary + "\r\n"
+                   "Content-Disposition: form-data; name=\"files[0]\"; filename=\"alarm_" +
+                   String(alarmId) + ".jpg\"\r\n"
+                   "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  // Discord 要求整包 multipart，先在 PSRAM 組好再一次 POST
+  size_t total = pre.length() + (jpg ? imgHead.length() + jpgSize : 0) + tail.length();
+  uint8_t *body = (uint8_t *)ps_malloc(total);
+  if (!body)
+  {
+    if (jpg) free(jpg);
+    Serial.println("Discord 通知失敗：PSRAM 配置失敗");
+    return;
+  }
+  size_t off = 0;
+  memcpy(body + off, pre.c_str(), pre.length());
+  off += pre.length();
+  if (jpg)
+  {
+    memcpy(body + off, imgHead.c_str(), imgHead.length());
+    off += imgHead.length();
+    memcpy(body + off, jpg, jpgSize);
+    off += jpgSize;
+    free(jpg);
+  }
+  memcpy(body + off, tail.c_str(), tail.length());
+
+  WiFiClientSecure client;
+  client.setInsecure(); // 不驗證憑證：webhook 網址本身即含密鑰，省去維護根憑證
+  HTTPClient https;
+  https.setConnectTimeout(8000);
+  https.setTimeout(15000);
+  if (https.begin(client, url))
+  {
+    https.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    int code = https.POST(body, total);
+    Serial.printf("Discord 通知 #%u -> HTTP %d %s\n", alarmId, code,
+                  (code >= 200 && code < 300) ? "OK" : "失敗");
+    https.end();
+  }
+  else
+  {
+    Serial.println("Discord 通知失敗：無法解析 Webhook URL");
+  }
+  free(body);
 }
 
 // ================= Web Server 處理函式 =================
@@ -707,7 +922,7 @@ void handleAlarmClear()
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// 網頁載入時 POST epoch=秒 同步時間 (AP 模式沒網路拿不到 NTP，用瀏覽器時間)
+// 網頁載入時 POST epoch=秒&tz=時區分鐘 同步時間 (AP 模式沒網路拿不到 NTP)
 void handleTimeSync()
 {
   long long epoch = atoll(server.arg("epoch").c_str());
@@ -716,6 +931,69 @@ void handleTimeSync()
     struct timeval tv = {(time_t)epoch, 0};
     settimeofday(&tv, NULL);
   }
+  if (server.hasArg("tz"))
+  {
+    tzOffsetMin = server.arg("tz").toInt();
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---------- Discord 推播設定 ----------
+
+void handleNotifyConfigGet()
+{
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  String url = discordWebhook;
+  xSemaphoreGive(notifyMutex);
+  server.send(200, "application/json", "{\"webhook\":\"" + jsonEscape(url) + "\"}");
+}
+
+// POST webhook=... 儲存到 NVS；傳空字串 = 清除/停用推播
+void handleNotifyConfigSet()
+{
+  String url = server.arg("webhook");
+  url.trim();
+  if (url.length() > 0 && !url.startsWith("https://"))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"Webhook 需為 https:// 開頭\"}");
+    return;
+  }
+
+  notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, false);
+  notifyPrefs.putString("webhook", url);
+  notifyPrefs.end();
+
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  discordWebhook = url;
+  xSemaphoreGive(notifyMutex);
+
+  Serial.println(url.length() > 0 ? "Discord Webhook 已更新" : "Discord Webhook 已清除");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// 排入一則測試訊息 (不帶圖片)，實際結果看序列埠與 Discord 頻道
+void handleNotifyTest()
+{
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  bool hasWebhook = discordWebhook.length() > 0;
+  xSemaphoreGive(notifyMutex);
+
+  if (!hasWebhook)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"尚未設定 Webhook URL\"}");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"STA 未連線，請先連上可上網的 Wi-Fi\"}");
+    return;
+  }
+
+  uint32_t id = 0;
+  xQueueSend(notifyQueue, &id, 0);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 

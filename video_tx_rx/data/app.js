@@ -380,6 +380,52 @@ sensRange.addEventListener("change", () => {
   if (region) sendMotionConfig();
 });
 
+// ---------- Discord 推播通知設定 ----------
+const webhookInput = document.getElementById("webhookInput");
+const webhookSaveBtn = document.getElementById("webhookSaveBtn");
+const webhookTestBtn = document.getElementById("webhookTestBtn");
+const webhookMsg = document.getElementById("webhookMsg");
+
+function setWebhookMsg(cls, text) {
+  webhookMsg.className = "msg " + cls;
+  webhookMsg.textContent = text;
+}
+
+async function loadNotifyConfig() {
+  try {
+    const res = await fetch("/notify/config");
+    const d = await res.json();
+    webhookInput.value = d.webhook || "";
+  } catch (e) {
+    /* 讀取失敗維持空白，可直接重新輸入 */
+  }
+}
+
+webhookSaveBtn.addEventListener("click", async () => {
+  const url = webhookInput.value.trim();
+  try {
+    const body = new URLSearchParams({ webhook: url });
+    const res = await fetch("/notify/config", { method: "POST", body });
+    const d = await res.json();
+    if (d.ok) setWebhookMsg("ok", url ? "已儲存" : "已清除，推播停用");
+    else setWebhookMsg("err", d.error || "儲存失敗");
+  } catch (e) {
+    setWebhookMsg("err", "儲存失敗");
+  }
+});
+
+webhookTestBtn.addEventListener("click", async () => {
+  setWebhookMsg("", "傳送中...");
+  try {
+    const res = await fetch("/notify/test", { method: "POST" });
+    const d = await res.json();
+    if (d.ok) setWebhookMsg("ok", "已排入傳送，請到 Discord 頻道確認");
+    else setWebhookMsg("err", d.error || "測試失敗");
+  } catch (e) {
+    setWebhookMsg("err", "測試失敗");
+  }
+});
+
 // ---------- 裝置端偵測狀態輪詢 ----------
 // 不管停在哪個頁面都輪詢：偵測跑在 ESP32 上，新告警要即時跳通知。
 let lastSeenAlarmId = null; // 第一次輪詢先當基準，之後 id 變大 = 新告警
@@ -684,11 +730,14 @@ function doOtaUpload() {
 otaBtn.addEventListener("click", doOtaUpload);
 
 // ================= 啟動 =================
-// 把瀏覽器時間同步給 ESP32 (AP 模式沒有 NTP)，告警紀錄才有真實時間戳
+// 把瀏覽器時間 + 時區同步給 ESP32 (AP 模式沒有 NTP)，告警紀錄/推播才有真實時間
 function syncTime() {
   fetch("/time", {
     method: "POST",
-    body: new URLSearchParams({ epoch: Math.floor(Date.now() / 1000) }),
+    body: new URLSearchParams({
+      epoch: Math.floor(Date.now() / 1000),
+      tz: -new Date().getTimezoneOffset(), // 分鐘，UTC+8 = 480
+    }),
   }).catch(() => {});
 }
 syncTime();
@@ -697,5 +746,6 @@ setInterval(syncTime, 10 * 60 * 1000);
 refreshStatus();
 setInterval(refreshStatus, 2000);
 doScan();
+loadNotifyConfig();
 pollMotion();
 frameLoop();

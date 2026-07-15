@@ -80,6 +80,12 @@ Setup24_ST7789.h 設定
     - 網頁每秒輪詢 GET `/motion/status`（enabled/region/diff/triggered/lastId/count）更新綠框/紅框、DIFF %、
       並比對 lastId 偵測新告警 → 右下角 toast 通知 + 蜂鳴 + 側欄「告警紀錄」紅色計數徽章
     - 同樣有旋轉按鈕；框選/綠紅框顯示會依旋轉角度自動換算，與畫面一致
+    - Discord 推播通知：觸發告警時由獨立任務 (core 1) 將「時間 + 擷取影像」以 multipart POST 到 Discord Webhook，
+      手機安裝 Discord App 即收到推播；需 STA 連上可上網的 Wi-Fi
+      - Webhook URL 存 NVS（GET/POST `/notify/config`，空字串 = 停用）、POST `/notify/test` 送測試訊息
+      - 訊息時間使用瀏覽器 POST `/time` 同步的 epoch + 時區 (tz 分鐘)
+    - ST7789 同步顯示：TFT 串流畫面每幀疊加偵測框（綠 = 監控、紅 = 觸發，與網頁一致），
+      觸發時右上角顯示黃色小鈴鐺（用 TFT 基本圖形拼出，觸發保持 1.5 秒）
   - 告警紀錄：移動偵測觸發時韌體自動以 frame2jpg 擷取當下畫面
     - 每筆紀錄含觸發時間 + 觸發擷取圖片，存於 PSRAM 環形緩衝（保留最近 10 筆，滿了覆蓋最舊；斷電/重啟即清空）
     - 兩筆告警最小間隔 5 秒，避免連續移動灌爆紀錄
@@ -92,8 +98,8 @@ Setup24_ST7789.h 設定
 
 核心分工：
 
-- 原始核心 (core 1，`setup()`/`loop()`)：Wi-Fi AP/STA + WebServer + LED 控制
-- 備用核心 (core 0，`xTaskCreatePinnedToCore`)：相機擷取影像並串流顯示到 ST7789 + 移動偵測比對與告警擷取
+- 原始核心 (core 1，`setup()`/`loop()`)：Wi-Fi AP/STA + WebServer + LED 控制 + Discord 推播任務（`notifyTask`）
+- 備用核心 (core 0，`xTaskCreatePinnedToCore`)：相機擷取影像並串流顯示到 ST7789（含偵測框/鈴鐺疊加）+ 移動偵測比對與告警擷取
 
 燒錄注意事項：
 
