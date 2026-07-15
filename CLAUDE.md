@@ -73,8 +73,18 @@ Setup24_ST7789.h 設定
     - 清除 SSID 按鍵（POST `/clear`，清除 NVS 設定並斷開 STA，熱點保持開啟可重新設定）
   - 影像串流：瀏覽器輪詢 GET `/capture`（相機任務將 RGB565 幀以 frame2jpg 轉 JPEG 快照回傳）顯示即時影像
     - 旋轉按鈕：0°/90°/180°/270° 循環切換（瀏覽器端 canvas 旋轉，與移動偵測共用角度，存 localStorage）
-  - 移動偵測：在影像上拖曳框選偵測區域，瀏覽器端做畫格差異比對；綠框 = 正常、紅框 = 已觸發，附靈敏度調整
-    - 同樣有旋轉按鈕；偵測取樣直接來自已旋轉的畫布，框選座標與顯示畫面一致，切換角度時會重置比對基準
+  - 移動偵測：在影像上拖曳框選偵測區域，**偵測在 ESP32 裝置端 (core 0) 逐幀進行**，關閉網頁仍持續監控
+    - 網頁 POST `/motion/config`（enabled/x/y/w/h/sens）設定區域與靈敏度；區域以感光元件方向的 240x240 座標保存，
+      網頁端負責把旋轉後的框選反向換算回感光元件座標
+    - 韌體把區域縮取樣成 32x32 灰階與上一幀比對，變動比例 > (16 - 靈敏度)% 即觸發
+    - 網頁每秒輪詢 GET `/motion/status`（enabled/region/diff/triggered/lastId/count）更新綠框/紅框、DIFF %、
+      並比對 lastId 偵測新告警 → 右下角 toast 通知 + 蜂鳴 + 側欄「告警紀錄」紅色計數徽章
+    - 同樣有旋轉按鈕；框選/綠紅框顯示會依旋轉角度自動換算，與畫面一致
+  - 告警紀錄：移動偵測觸發時韌體自動以 frame2jpg 擷取當下畫面
+    - 每筆紀錄含觸發時間 + 觸發擷取圖片，存於 PSRAM 環形緩衝（保留最近 10 筆，滿了覆蓋最舊；斷電/重啟即清空）
+    - 兩筆告警最小間隔 5 秒，避免連續移動灌爆紀錄
+    - GET `/alarms` 回傳清單（新到舊）、GET `/alarm/img?id=N` 回傳 JPEG、POST `/alarm/clear` 清除全部
+    - 觸發時間由網頁載入時 POST `/time`（瀏覽器 epoch）同步到裝置（AP 模式無 NTP）；未同步前的紀錄顯示「時間未同步」
   - OTA 更新：上傳 .bin 無線更新（POST `/update?target=firmware|spiffs`，使用 Update.h）
     - target=firmware：韌體 .bin（Arduino IDE「Sketch > Export Compiled Binary」）
     - target=spiffs：SPIFFS 映像檔（mkspiffs 打包 `data` 資料夾），可免拉線更新網頁
@@ -83,7 +93,7 @@ Setup24_ST7789.h 設定
 核心分工：
 
 - 原始核心 (core 1，`setup()`/`loop()`)：Wi-Fi AP/STA + WebServer + LED 控制
-- 備用核心 (core 0，`xTaskCreatePinnedToCore`)：相機擷取影像並串流顯示到 ST7789
+- 備用核心 (core 0，`xTaskCreatePinnedToCore`)：相機擷取影像並串流顯示到 ST7789 + 移動偵測比對與告警擷取
 
 燒錄注意事項：
 

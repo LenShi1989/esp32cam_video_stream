@@ -21,6 +21,10 @@
       <div class="nav-item" data-view="motion">
         <span class="ico">◎</span>移動偵測
       </div>
+      <div class="nav-item" data-view="alarm">
+        <span class="ico">⚠</span>告警紀錄
+        <span id="alarmNavBadge" class="nav-badge" hidden>0</span>
+      </div>
       <div class="nav-item" data-view="ota">
         <span class="ico">⇪</span>OTA 更新
       </div>
@@ -161,7 +165,26 @@
           <p class="muted" style="margin: 12px 0 0">
             在畫面上拖曳框選偵測區域：<span style="color: var(--ok)">綠框</span>
             = 正常、<span style="color: var(--err)">紅框</span> =
-            偵測到移動。偵測在瀏覽器端進行，需停留在此頁面。
+            偵測到移動。偵測在 ESP32
+            裝置端逐幀進行，關閉網頁仍持續監控；觸發時自動擷取影像存入「告警紀錄」（兩筆告警間隔至少
+            5 秒）。
+          </p>
+        </div>
+      </section>
+
+      <!-- ========== 告警紀錄 ========== -->
+      <section id="panel-alarm" class="panel">
+        <div class="card">
+          <div class="row" style="margin-bottom: 10px">
+            <h2 style="margin: 0">移動偵測告警</h2>
+            <button id="alarmClearBtn" class="danger" type="button">
+              清除紀錄
+            </button>
+          </div>
+          <div id="alarmListEl" class="alarm-list"></div>
+          <p class="muted" style="margin: 12px 0 0">
+            保留最近 10 筆（觸發時間 +
+            觸發當下擷取影像），儲存於裝置記憶體，斷電或重新啟動後清空。點選影像可開新分頁檢視原圖。
           </p>
         </div>
       </section>
@@ -206,6 +229,8 @@
         </div>
       </section>
     </main>
+
+    <div id="toast" class="toast" hidden></div>
 
     <script src="./app.js"></script>
   </body>

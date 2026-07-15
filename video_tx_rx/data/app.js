@@ -4,6 +4,7 @@ const VIEW_TITLES = {
   wifi: "Wi-Fi 設定",
   stream: "影像串流",
   motion: "移動偵測",
+  alarm: "告警紀錄",
   ota: "OTA 更新",
 };
 let currentView = "console";
@@ -20,6 +21,7 @@ document.querySelectorAll(".nav-item").forEach((item) => {
         p.classList.toggle("active", p.id === "panel-" + currentView),
       );
     document.getElementById("viewTitle").textContent = VIEW_TITLES[currentView];
+    if (currentView === "alarm") loadAlarms();
   });
 });
 
@@ -237,7 +239,7 @@ function cycleRotate() {
   rotateDeg = (rotateDeg + 90) % 360;
   localStorage.setItem("rotateDeg", rotateDeg);
   updateRotateUI();
-  prevGray = null; // 旋轉後畫面內容改變，重置偵測基準避免誤判
+  drawOverlay(); // 偵測區域以感光元件座標保存，旋轉後重畫對應的顯示位置
 }
 streamRotateBtn.addEventListener("click", cycleRotate);
 motionRotateBtn.addEventListener("click", cycleRotate);
@@ -275,7 +277,6 @@ async function frameLoop() {
       }
       if (wantMotion) {
         drawRotated(motionCtx, bmp, motionCanvas.width, motionCanvas.height);
-        detectMotion();
       }
       bmp.close();
     } catch (e) {
@@ -287,7 +288,7 @@ async function frameLoop() {
   }
 }
 
-// ================= 移動偵測 =================
+// ================= 移動偵測 (偵測在 ESP32 裝置端進行) =================
 const motionOverlay = document.getElementById("motionOverlay");
 const overlayCtx = motionOverlay.getContext("2d");
 const motionBadge = document.getElementById("motionBadge");
@@ -295,16 +296,42 @@ const motionHud = document.getElementById("motionHud");
 const motionClearBtn = document.getElementById("motionClearBtn");
 const sensRange = document.getElementById("sensRange");
 
-const SAMPLE = 48; // 偵測區域縮到 48x48 再比較，降低運算量
-const sampleCanvas = document.createElement("canvas");
-sampleCanvas.width = SAMPLE;
-sampleCanvas.height = SAMPLE;
-const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+// 偵測設定保存在 ESP32；region 一律用「感光元件方向」的 240x240 座標，
+// 與韌體端一致，顯示時再依 rotateDeg 轉成畫布座標。
+let region = null; // {x, y, w, h} 感光元件座標
+let selecting = null; // 拖曳中的起點 {x, y} (畫布座標)
+let deviceTriggered = false; // 由 /motion/status 輪詢更新
+let motionSynced = false; // 是否已從裝置取回一次設定 (頁面重整後還原)
 
-let region = null; // {x, y, w, h} 以 240x240 畫布座標表示
-let selecting = null; // 拖曳中的起點 {x, y}
-let prevGray = null; // 上一幀偵測區域的灰階資料
-let triggeredUntil = 0; // 觸發後紅框保持到此時間戳
+// 依 90° 倍數旋轉矩形座標 (size x size 正方形畫布)，負角度為反向旋轉
+function rotateRect(r, deg, size) {
+  switch (((deg % 360) + 360) % 360) {
+    case 90:
+      return { x: size - r.y - r.h, y: r.x, w: r.h, h: r.w };
+    case 180:
+      return { x: size - r.x - r.w, y: size - r.y - r.h, w: r.w, h: r.h };
+    case 270:
+      return { x: r.y, y: size - r.x - r.w, w: r.h, h: r.w };
+    default:
+      return { x: r.x, y: r.y, w: r.w, h: r.h };
+  }
+}
+
+async function sendMotionConfig() {
+  const body = new URLSearchParams({
+    enabled: region ? "1" : "0",
+    x: region ? Math.round(region.x) : 0,
+    y: region ? Math.round(region.y) : 0,
+    w: region ? Math.round(region.w) : 0,
+    h: region ? Math.round(region.h) : 0,
+    sens: sensRange.value,
+  });
+  try {
+    await fetch("/motion/config", { method: "POST", body });
+  } catch (e) {
+    /* 失敗時下次輪詢會反映裝置實際設定 */
+  }
+}
 
 function canvasPos(e) {
   const rect = motionOverlay.getBoundingClientRect();
@@ -335,70 +362,64 @@ motionOverlay.addEventListener("pointerup", (e) => {
   const w = Math.abs(cur.x - start.x),
     h = Math.abs(cur.y - start.y);
   if (w >= 12 && h >= 12) {
-    region = { x, y, w, h };
-    prevGray = null;
-    triggeredUntil = 0;
+    // 框選畫在旋轉後的畫面上，反向旋轉回感光元件座標再交給韌體
+    region = rotateRect({ x, y, w, h }, -rotateDeg, motionOverlay.width);
+    sendMotionConfig();
   }
   drawOverlay();
 });
 
 motionClearBtn.addEventListener("click", () => {
   region = null;
-  prevGray = null;
-  triggeredUntil = 0;
   motionHud.textContent = "DIFF --%";
+  sendMotionConfig();
   drawOverlay();
 });
 
-function detectMotion() {
-  if (!region) {
-    motionBadge.className = "badge";
-    motionBadge.textContent = "未設定區域";
+sensRange.addEventListener("change", () => {
+  if (region) sendMotionConfig();
+});
+
+// ---------- 裝置端偵測狀態輪詢 ----------
+// 不管停在哪個頁面都輪詢：偵測跑在 ESP32 上，新告警要即時跳通知。
+let lastSeenAlarmId = null; // 第一次輪詢先當基準，之後 id 變大 = 新告警
+
+async function pollMotion() {
+  try {
+    const res = await fetch("/motion/status");
+    const d = await res.json();
+
+    if (!motionSynced) {
+      // 頁面剛載入：還原裝置上已生效的區域與靈敏度
+      motionSynced = true;
+      if (d.enabled) region = { x: d.x, y: d.y, w: d.w, h: d.h };
+      sensRange.value = d.sens;
+    }
+
+    deviceTriggered = !!d.triggered;
+    if (d.enabled) {
+      motionHud.textContent = "DIFF " + Number(d.diff).toFixed(1) + "%";
+      motionBadge.className = deviceTriggered ? "badge alert" : "badge normal";
+      motionBadge.textContent = deviceTriggered ? "偵測到移動" : "監控中";
+    } else {
+      motionBadge.className = "badge";
+      motionBadge.textContent = "未設定區域";
+    }
     drawOverlay();
-    return;
-  }
 
-  // 直接從已套用旋轉的 motionCanvas 取框選區域 (座標系一致)，
-  // 縮到 SAMPLE x SAMPLE 後轉灰階與上一幀比較
-  sampleCtx.drawImage(
-    motionCanvas,
-    region.x,
-    region.y,
-    region.w,
-    region.h,
-    0,
-    0,
-    SAMPLE,
-    SAMPLE,
-  );
-  const img = sampleCtx.getImageData(0, 0, SAMPLE, SAMPLE).data;
-
-  const gray = new Uint8Array(SAMPLE * SAMPLE);
-  for (let i = 0; i < gray.length; i++) {
-    const p = i * 4;
-    gray[i] = (img[p] * 3 + img[p + 1] * 4 + img[p + 2]) >> 3;
-  }
-
-  if (prevGray) {
-    let changed = 0;
-    for (let i = 0; i < gray.length; i++) {
-      if (Math.abs(gray[i] - prevGray[i]) > 28) changed++;
+    updateAlarmBadge(d.count);
+    if (lastSeenAlarmId === null) {
+      lastSeenAlarmId = d.lastId;
+    } else if (d.lastId > lastSeenAlarmId) {
+      lastSeenAlarmId = d.lastId;
+      notifyAlarm();
+      if (currentView === "alarm") loadAlarms();
     }
-    const ratio = (changed / gray.length) * 100;
-    motionHud.textContent = "DIFF " + ratio.toFixed(1) + "%";
-    // 靈敏度滑桿 1(最靈敏)~15：變動像素比例門檻 %
-    const threshold = 16 - Number(sensRange.value);
-    if (ratio > threshold) {
-      triggeredUntil = performance.now() + 1500;
-    }
+  } catch (e) {
+    /* 離線狀態由 refreshStatus 顯示，這裡靜默重試 */
   }
-  prevGray = gray;
-
-  const triggered = performance.now() < triggeredUntil;
-  motionBadge.className = triggered ? "badge alert" : "badge normal";
-  motionBadge.textContent = triggered ? "偵測到移動" : "監控中";
-  drawOverlay();
 }
+setInterval(pollMotion, 1000);
 
 function drawOverlay() {
   overlayCtx.clearRect(0, 0, motionOverlay.width, motionOverlay.height);
@@ -419,19 +440,20 @@ function drawOverlay() {
   }
   if (!region) return;
 
-  const triggered = performance.now() < triggeredUntil;
-  const color = triggered ? "#ff3860" : "#2bff88";
+  // region 為感光元件座標，先轉成目前旋轉角度下的畫布座標
+  const disp = rotateRect(region, rotateDeg, motionOverlay.width);
+  const color = deviceTriggered ? "#ff3860" : "#2bff88";
   overlayCtx.strokeStyle = color;
   overlayCtx.shadowColor = color;
   overlayCtx.shadowBlur = 8;
   overlayCtx.lineWidth = 2;
-  overlayCtx.strokeRect(region.x, region.y, region.w, region.h);
+  overlayCtx.strokeRect(disp.x, disp.y, disp.w, disp.h);
   overlayCtx.shadowBlur = 0;
 
   // 四角加強線，做出瞄準框效果
-  const L = Math.min(14, region.w / 3, region.h / 3);
+  const L = Math.min(14, disp.w / 3, disp.h / 3);
   overlayCtx.lineWidth = 4;
-  const { x, y, w, h } = region;
+  const { x, y, w, h } = disp;
   const corners = [
     [
       [x, y + L],
@@ -461,6 +483,115 @@ function drawOverlay() {
     overlayCtx.lineTo(pts[2][0], pts[2][1]);
     overlayCtx.stroke();
   });
+}
+
+// ================= 告警紀錄 =================
+const alarmListEl = document.getElementById("alarmListEl");
+const alarmClearBtn = document.getElementById("alarmClearBtn");
+const alarmNavBadge = document.getElementById("alarmNavBadge");
+const toast = document.getElementById("toast");
+
+function updateAlarmBadge(count) {
+  alarmNavBadge.hidden = !count;
+  alarmNavBadge.textContent = count;
+}
+
+function fmtAlarmTime(epoch) {
+  // 裝置時間靠網頁載入時同步，未同步前的紀錄只有開機經過秒數
+  if (epoch < 1000000000) return "時間未同步";
+  return new Date(epoch * 1000).toLocaleString("zh-TW", { hour12: false });
+}
+
+async function loadAlarms() {
+  try {
+    const res = await fetch("/alarms");
+    const list = await res.json();
+    alarmListEl.innerHTML = "";
+    if (!list.length) {
+      alarmListEl.innerHTML =
+        '<p class="muted" style="margin:0">目前沒有告警紀錄</p>';
+      return;
+    }
+    list.forEach((a) => {
+      const item = document.createElement("div");
+      item.className = "alarm-item";
+
+      const link = document.createElement("a");
+      link.href = "/alarm/img?id=" + a.id;
+      link.target = "_blank";
+      const img = document.createElement("img");
+      img.src = link.href;
+      img.loading = "lazy";
+      img.style.transform = "rotate(" + rotateDeg + "deg)"; // 與串流頁同角度顯示
+      link.appendChild(img);
+
+      const info = document.createElement("div");
+      info.className = "alarm-info";
+      const idEl = document.createElement("span");
+      idEl.className = "alarm-id";
+      idEl.textContent = "#" + a.id;
+      const timeEl = document.createElement("span");
+      timeEl.className = "alarm-time";
+      timeEl.textContent = fmtAlarmTime(a.time);
+      const noteEl = document.createElement("span");
+      noteEl.className = "muted";
+      noteEl.textContent = "移動偵測觸發";
+      info.append(idEl, timeEl, noteEl);
+
+      item.append(link, info);
+      alarmListEl.appendChild(item);
+    });
+  } catch (e) {
+    alarmListEl.innerHTML =
+      '<p class="muted" style="margin:0">讀取告警紀錄失敗</p>';
+  }
+}
+
+alarmClearBtn.addEventListener("click", async () => {
+  if (!confirm("確定要清除全部告警紀錄？")) return;
+  try {
+    await fetch("/alarm/clear", { method: "POST" });
+  } catch (e) {
+    /* 清除失敗時列表重新載入會顯示實際內容 */
+  }
+  updateAlarmBadge(0);
+  loadAlarms();
+});
+
+// ---------- 觸發通知：右下角 toast + 蜂鳴 ----------
+let toastTimer = null;
+function notifyAlarm() {
+  toast.textContent =
+    "⚠ 偵測到移動！已擷取告警影像 " +
+    new Date().toLocaleTimeString("zh-TW", { hour12: false });
+  toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.hidden = true;
+  }, 4000);
+  beep();
+}
+
+let audioCtx = null;
+function beep() {
+  try {
+    audioCtx =
+      audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    for (let i = 0; i < 2; i++) {
+      const t = audioCtx.currentTime + i * 0.25;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.connect(g);
+      g.connect(audioCtx.destination);
+      o.frequency.value = 880;
+      g.gain.setValueAtTime(0.12, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      o.start(t);
+      o.stop(t + 0.2);
+    }
+  } catch (e) {
+    /* 瀏覽器可能在使用者互動前禁止播放音效 */
+  }
 }
 
 // ================= OTA 更新 =================
@@ -553,7 +684,18 @@ function doOtaUpload() {
 otaBtn.addEventListener("click", doOtaUpload);
 
 // ================= 啟動 =================
+// 把瀏覽器時間同步給 ESP32 (AP 模式沒有 NTP)，告警紀錄才有真實時間戳
+function syncTime() {
+  fetch("/time", {
+    method: "POST",
+    body: new URLSearchParams({ epoch: Math.floor(Date.now() / 1000) }),
+  }).catch(() => {});
+}
+syncTime();
+setInterval(syncTime, 10 * 60 * 1000);
+
 refreshStatus();
 setInterval(refreshStatus, 2000);
 doScan();
+pollMotion();
 frameLoop();

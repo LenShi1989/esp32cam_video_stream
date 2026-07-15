@@ -493,6 +493,77 @@ input[type="file"]::file-selector-button {
   transition: width 0.15s;
 }
 
+/* 告警紀錄 */
+.nav-badge {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 56, 96, 0.15);
+  border: 1px solid rgba(255, 56, 96, 0.55);
+  color: var(--err);
+  font-size: 11px;
+  text-align: center;
+  font-family: Consolas, monospace;
+}
+.alarm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 62vh;
+  overflow-y: auto;
+}
+.alarm-item {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0a101d;
+}
+.alarm-item img {
+  display: block;
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  flex: none;
+}
+.alarm-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.alarm-id {
+  color: var(--cyan);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}
+.alarm-time {
+  font-family: Consolas, monospace;
+  font-size: 14px;
+}
+
+/* 告警 toast 通知 */
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 99;
+  padding: 12px 18px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 56, 96, 0.6);
+  background: rgba(20, 6, 12, 0.92);
+  color: var(--err);
+  font-size: 13px;
+  letter-spacing: 1px;
+  box-shadow: 0 0 18px rgba(255, 56, 96, 0.35);
+  animation: fadeIn 0.2s ease;
+}
+
 /* 窄螢幕：側邊欄變成頂端橫列 */
 @media (max-width: 640px) {
   body {

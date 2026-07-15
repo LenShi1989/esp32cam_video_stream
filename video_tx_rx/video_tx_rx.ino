@@ -42,6 +42,8 @@
 #include <SPIFFS.h>
 #include <Preferences.h>
 #include <Update.h> // OTA：網頁上傳 .bin 更新韌體 / SPIFFS
+#include <time.h>
+#include <sys/time.h> // settimeofday：由網頁同步時間，供告警紀錄時間戳使用
 #include "img_converters.h" // frame2jpg：RGB565 -> JPEG，供網頁快照串流使用
 
 // ---------- TFT 顯示尺寸 ----------
@@ -97,8 +99,49 @@ SemaphoreHandle_t jpegReadySem;
 volatile bool otaInProgress = false;
 bool otaSuccess = false;
 
+// ---------- 移動偵測 (core 0 逐幀比對，core 1 讀寫設定) ----------
+// 偵測區域縮取樣成 MOTION_GRID x MOTION_GRID 灰階，與上一幀比較，
+// 變動像素比例超過門檻 (16 - 靈敏度)% 即觸發。區域座標為感光元件
+// 原始方向的 240x240 座標，網頁端負責把旋轉後的框選換算回來。
+#define MOTION_GRID 32
+#define MOTION_PIXEL_DIFF 28    // 單點灰階差異門檻 (灰階值 0~250)
+#define MOTION_TRIGGER_HOLD_MS 1500 // 觸發後紅框/告警狀態保持時間
+#define MOTION_COOLDOWN_MS 5000 // 兩筆告警紀錄的最小間隔，避免連續移動灌爆紀錄
+
+struct MotionConfig
+{
+  bool enabled;
+  int x, y, w, h;  // 偵測區域 (感光元件座標)
+  int sensitivity; // 1(最靈敏)~15，門檻 = (16 - sensitivity)%
+};
+MotionConfig motionCfg = {false, 0, 0, 0, 0, 4};
+SemaphoreHandle_t motionCfgMutex;
+volatile bool motionResetBaseline = false; // 設定變更後丟棄上一幀基準
+volatile float motionDiff = 0;             // 最近一次比對的變動比例 (%)
+volatile uint32_t motionTriggeredUntilMs = 0;
+
+// ---------- 告警紀錄 (觸發時間 + 觸發當下 JPEG，存於 PSRAM 環形緩衝) ----------
+// 注意：紀錄放在 RAM，斷電/重開機即消失；SPIFFS 僅 128KB 且寫入 flash
+// 會與相機任務衝突，故不落地。
+#define MAX_ALARMS 10
+
+struct AlarmRec
+{
+  uint32_t id;
+  time_t epoch; // 觸發時間 (由網頁 POST /time 同步後才是真實時間)
+  uint8_t *jpg;
+  size_t len;
+};
+AlarmRec alarmList[MAX_ALARMS] = {};
+int alarmWrite = 0;                 // 下一筆寫入位置
+int alarmCount = 0;                 // 目前保存筆數 (<= MAX_ALARMS)
+volatile uint32_t alarmLastId = 0;  // 最新一筆 id，網頁輪詢比對用
+SemaphoreHandle_t alarmMutex;
+
 static bool initCamera();
 void cameraTask(void *param);
+void detectMotionOnFrame(camera_fb_t *fb);
+void addAlarmRecord(camera_fb_t *fb);
 String jsonEscape(const String &s);
 void handleRoot();
 void handleScan();
@@ -107,6 +150,12 @@ void handleStatus();
 void handleLed();
 void handleCapture();
 void handleClearWifi();
+void handleMotionConfig();
+void handleMotionStatus();
+void handleAlarmList();
+void handleAlarmImage();
+void handleAlarmClear();
+void handleTimeSync();
 void handleUpdateFinished();
 void handleUpdateUpload();
 void tryAutoConnectSavedWifi();
@@ -146,6 +195,8 @@ void setup()
 
   jpegMutex = xSemaphoreCreateMutex();
   jpegReadySem = xSemaphoreCreateBinary();
+  motionCfgMutex = xSemaphoreCreateMutex();
+  alarmMutex = xSemaphoreCreateMutex();
 
   server.on("/", HTTP_GET, handleRoot);
   server.serveStatic("/style.css", SPIFFS, "/style.css");
@@ -156,6 +207,12 @@ void setup()
   server.on("/led", HTTP_GET, handleLed);
   server.on("/capture", HTTP_GET, handleCapture);
   server.on("/clear", HTTP_POST, handleClearWifi);
+  server.on("/motion/config", HTTP_POST, handleMotionConfig);
+  server.on("/motion/status", HTTP_GET, handleMotionStatus);
+  server.on("/alarms", HTTP_GET, handleAlarmList);
+  server.on("/alarm/img", HTTP_GET, handleAlarmImage);
+  server.on("/alarm/clear", HTTP_POST, handleAlarmClear);
+  server.on("/time", HTTP_POST, handleTimeSync);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   server.begin();
   Serial.println("Web Server 已啟動 (core 1)");
@@ -235,6 +292,9 @@ void cameraTask(void *param)
       tft.setAddrWindow(x, y, fb->width, fb->height);
       tft.pushPixels((uint16_t *)fb->buf, fb->len / 2);
       tft.endWrite();
+
+      // 移動偵測在裝置端逐幀進行，瀏覽器關掉也持續監控
+      detectMotionOnFrame(fb);
     }
 
     // 網頁 /capture 有人在等快照時，才把這一幀轉成 JPEG (約數十 ms)，
@@ -307,6 +367,116 @@ static bool initCamera()
     s->set_hmirror(s, 0);
   }
   return true;
+}
+
+// ---------- 移動偵測：core 0 逐幀比對 (RGB565) ----------
+
+void detectMotionOnFrame(camera_fb_t *fb)
+{
+  static uint8_t prevGray[MOTION_GRID * MOTION_GRID];
+  static bool prevValid = false;
+  static uint32_t lastAlarmMs = 0;
+
+  MotionConfig cfg;
+  xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
+  cfg = motionCfg;
+  if (motionResetBaseline)
+  {
+    motionResetBaseline = false;
+    prevValid = false;
+  }
+  xSemaphoreGive(motionCfgMutex);
+
+  if (!cfg.enabled || cfg.w < 8 || cfg.h < 8)
+  {
+    prevValid = false;
+    motionDiff = 0;
+    return;
+  }
+
+  // 區域內等距取 MOTION_GRID x MOTION_GRID 點轉灰階
+  // (相機 RGB565 為 big-endian，需先交換位元組)
+  const uint16_t *pix = (const uint16_t *)fb->buf;
+  uint8_t cur[MOTION_GRID * MOTION_GRID];
+  for (int gy = 0; gy < MOTION_GRID; gy++)
+  {
+    int sy = cfg.y + (gy * cfg.h) / MOTION_GRID;
+    if (sy >= fb->height) sy = fb->height - 1;
+    for (int gx = 0; gx < MOTION_GRID; gx++)
+    {
+      int sx = cfg.x + (gx * cfg.w) / MOTION_GRID;
+      if (sx >= fb->width) sx = fb->width - 1;
+      uint16_t p = pix[sy * fb->width + sx];
+      p = (p >> 8) | (p << 8);
+      uint8_t r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F, b = p & 0x1F;
+      // 近似亮度 3R + 2G + B (max 250)，與網頁版舊算法權重一致
+      cur[gy * MOTION_GRID + gx] = 3 * r + 2 * g + b;
+    }
+  }
+
+  if (prevValid)
+  {
+    int changed = 0;
+    for (int i = 0; i < MOTION_GRID * MOTION_GRID; i++)
+    {
+      if (abs((int)cur[i] - (int)prevGray[i]) > MOTION_PIXEL_DIFF) changed++;
+    }
+    float ratio = changed * 100.0f / (MOTION_GRID * MOTION_GRID);
+    motionDiff = ratio;
+
+    // 靈敏度 1(最靈敏)~15：變動像素比例門檻 %
+    if (ratio > (float)(16 - cfg.sensitivity))
+    {
+      motionTriggeredUntilMs = millis() + MOTION_TRIGGER_HOLD_MS;
+      if (lastAlarmMs == 0 || millis() - lastAlarmMs > MOTION_COOLDOWN_MS)
+      {
+        lastAlarmMs = millis();
+        addAlarmRecord(fb);
+      }
+    }
+  }
+  memcpy(prevGray, cur, sizeof(cur));
+  prevValid = true;
+}
+
+// 觸發告警：把當下畫面轉 JPEG 存進 PSRAM 環形緩衝 (滿了覆蓋最舊一筆)
+void addAlarmRecord(camera_fb_t *fb)
+{
+  uint8_t *out = NULL;
+  size_t outLen = 0;
+  if (!frame2jpg(fb, 80, &out, &outLen))
+  {
+    Serial.println("告警擷取失敗：frame2jpg 錯誤");
+    return;
+  }
+  // frame2jpg 配置在內部 RAM，複製到 PSRAM 保存以免排擠 WiFi 堆疊
+  uint8_t *copy = (uint8_t *)ps_malloc(outLen);
+  if (!copy)
+  {
+    free(out);
+    Serial.println("告警擷取失敗：PSRAM 配置失敗");
+    return;
+  }
+  memcpy(copy, out, outLen);
+  free(out);
+
+  xSemaphoreTake(alarmMutex, portMAX_DELAY);
+  AlarmRec *rec = &alarmList[alarmWrite];
+  if (rec->jpg)
+  {
+    free(rec->jpg);
+  }
+  uint32_t id = alarmLastId + 1;
+  rec->id = id;
+  rec->epoch = time(NULL);
+  rec->jpg = copy;
+  rec->len = outLen;
+  alarmLastId = id;
+  alarmWrite = (alarmWrite + 1) % MAX_ALARMS;
+  if (alarmCount < MAX_ALARMS) alarmCount++;
+  xSemaphoreGive(alarmMutex);
+
+  Serial.printf("移動偵測告警 #%u，JPEG %u bytes\n", id, (unsigned)outLen);
 }
 
 // ================= Web Server 處理函式 =================
@@ -432,6 +602,120 @@ void handleClearWifi()
   WiFi.disconnect(false, true);
   Serial.println("已清除儲存的 Wi-Fi 設定並斷線");
 
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// 設定偵測區域/靈敏度 (POST enabled=0|1&x&y&w&h&sens，座標為感光元件方向 240x240)
+void handleMotionConfig()
+{
+  bool enabled = server.arg("enabled") == "1";
+  int x = server.arg("x").toInt();
+  int y = server.arg("y").toInt();
+  int w = server.arg("w").toInt();
+  int h = server.arg("h").toInt();
+  int sens = server.arg("sens").toInt();
+
+  x = constrain(x, 0, TFT_WIDTH - 1);
+  y = constrain(y, 0, TFT_HEIGHT - 1);
+  w = constrain(w, 0, TFT_WIDTH - x);
+  h = constrain(h, 0, TFT_HEIGHT - y);
+  if (sens < 1 || sens > 15) sens = 4;
+  if (w < 8 || h < 8) enabled = false;
+
+  xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
+  motionCfg = {enabled, x, y, w, h, sens};
+  motionResetBaseline = true;
+  xSemaphoreGive(motionCfgMutex);
+  motionTriggeredUntilMs = 0;
+
+  Serial.printf("移動偵測設定: %s 區域(%d,%d %dx%d) 靈敏度=%d\n",
+                enabled ? "啟用" : "停用", x, y, w, h, sens);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleMotionStatus()
+{
+  xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
+  MotionConfig cfg = motionCfg;
+  xSemaphoreGive(motionCfgMutex);
+
+  bool triggered = (int32_t)(motionTriggeredUntilMs - millis()) > 0;
+  String json = "{";
+  json += "\"enabled\":" + String(cfg.enabled ? "true" : "false");
+  json += ",\"x\":" + String(cfg.x) + ",\"y\":" + String(cfg.y);
+  json += ",\"w\":" + String(cfg.w) + ",\"h\":" + String(cfg.h);
+  json += ",\"sens\":" + String(cfg.sensitivity);
+  json += ",\"diff\":" + String(motionDiff, 1);
+  json += ",\"triggered\":" + String(triggered ? "true" : "false");
+  json += ",\"lastId\":" + String(alarmLastId);
+  json += ",\"count\":" + String(alarmCount);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// 告警清單 (新到舊)：[{"id":N,"time":epoch}, ...]
+void handleAlarmList()
+{
+  xSemaphoreTake(alarmMutex, portMAX_DELAY);
+  String json = "[";
+  for (int i = 0; i < alarmCount; i++)
+  {
+    int idx = (alarmWrite - 1 - i + MAX_ALARMS * 2) % MAX_ALARMS;
+    if (i > 0) json += ",";
+    json += "{\"id\":" + String(alarmList[idx].id) +
+            ",\"time\":" + String((uint32_t)alarmList[idx].epoch) + "}";
+  }
+  json += "]";
+  xSemaphoreGive(alarmMutex);
+  server.send(200, "application/json", json);
+}
+
+void handleAlarmImage()
+{
+  uint32_t id = (uint32_t)server.arg("id").toInt();
+
+  xSemaphoreTake(alarmMutex, portMAX_DELAY);
+  for (int i = 0; i < alarmCount; i++)
+  {
+    if (alarmList[i].id == id && alarmList[i].jpg)
+    {
+      // 送出期間持有鎖，避免環形緩衝覆蓋/清除已釋放的 JPEG
+      server.sendHeader("Cache-Control", "max-age=3600"); // id 唯一，可放心快取
+      server.send_P(200, "image/jpeg", (const char *)alarmList[i].jpg, alarmList[i].len);
+      xSemaphoreGive(alarmMutex);
+      return;
+    }
+  }
+  xSemaphoreGive(alarmMutex);
+  server.send(404, "application/json", "{\"error\":\"alarm not found\"}");
+}
+
+void handleAlarmClear()
+{
+  xSemaphoreTake(alarmMutex, portMAX_DELAY);
+  for (int i = 0; i < MAX_ALARMS; i++)
+  {
+    if (alarmList[i].jpg)
+    {
+      free(alarmList[i].jpg);
+    }
+    alarmList[i] = {};
+  }
+  alarmWrite = 0;
+  alarmCount = 0;
+  xSemaphoreGive(alarmMutex);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// 網頁載入時 POST epoch=秒 同步時間 (AP 模式沒網路拿不到 NTP，用瀏覽器時間)
+void handleTimeSync()
+{
+  long long epoch = atoll(server.arg("epoch").c_str());
+  if (epoch > 1000000000LL)
+  {
+    struct timeval tv = {(time_t)epoch, 0};
+    settimeofday(&tv, NULL);
+  }
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
