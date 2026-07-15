@@ -90,4 +90,28 @@ Setup24_ST7789.h 設定
 - Partition Scheme 需選含 SPIFFS 的方案（`.vscode/arduino.json` 已設為 `min_spiffs`）
 - `video_tx_rx/data/` 內的 `index.html`、`style.css`、`app.js` 需一併上傳到 SPIFFS，才能讓 `/` 網頁正常顯示
   （例如使用 Arduino IDE 的 ESP32 Sketch Data Upload 外掛，或 arduino-cli + mkspiffs/esptool 燒錄 `data` 資料夾；
-  之後也可從網頁「OTA 更新」頁面上傳 SPIFFS 映像檔免拉線更新）
+  之後也可從網頁「OTA 更新」頁面上傳 SPIFFS 映像檔免拉線更新，步驟見下節）
+
+## 打包 data/ 的 SPIFFS 映像檔並從網頁「OTA 更新」上傳
+
+修改 `data/` 內的網頁檔（`index.html`、`style.css`、`app.js`）後，不必拉線重燒，
+用 mkspiffs 打包成映像檔再從網頁 OTA 上傳即可：
+
+1. 打包 SPIFFS 映像檔。mkspiffs 隨 arduino-esp32 核心一起安裝，
+   在 `video_tx_rx/` 資料夾下執行（PowerShell，版本號依實際安裝調整）：
+
+   ```powershell
+   & "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\mkspiffs\0.2.3\mkspiffs.exe" -c data -b 4096 -p 256 -s 0x20000 spiffs.bin
+   ```
+
+   - `-s 0x20000`（128KB）必須等於 `min_spiffs` 分割表中 spiffs 分割區的大小；
+     若改用其他 Partition Scheme，需查對應分割表（`Arduino15\packages\esp32\hardware\esp32\<版本>\tools\partitions\*.csv`）調整
+   - `-b 4096 -p 256` 為 ESP32 SPIFFS 預設 block/page 大小，不可更改
+   - 輸出的 `spiffs.bin` 請放在 `data/` 之外（如上指令放在 `video_tx_rx/`），
+     否則下次打包會把映像檔本身也包進去
+2. 瀏覽器連上 ESP32：連熱點 `esp32_init` 開 `http://192.168.4.1`，或用 STA 模式取得的 IP
+3. 側邊欄「OTA 更新」→ 更新目標選「SPIFFS 網頁資料」→ 選擇 `spiffs.bin` → 開始更新
+4. 上傳完成後裝置自動重新啟動，網頁約 10 秒後自動重新整理，即載入新版網頁
+
+> 注意：`spiffs.bin` 是整包映像檔，上傳會覆蓋 SPIFFS 分割區全部內容，
+> 打包時 `data/` 內必須包含完整的三個網頁檔，缺檔會導致對應頁面載入失敗。
