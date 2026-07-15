@@ -34,6 +34,7 @@ const stConn = document.getElementById("stConn");
 const stSsid = document.getElementById("stSsid");
 const stIp = document.getElementById("stIp");
 const stCam = document.getElementById("stCam");
+const stStorage = document.getElementById("stStorage");
 const ledBtn = document.getElementById("ledBtn");
 const ledBtnText = document.getElementById("ledBtnText");
 
@@ -78,6 +79,9 @@ async function refreshStatus() {
     stIp.textContent = data.connected ? data.ip : "--";
     stCam.textContent = data.camera ? "運作中" : "初始化失敗";
     stCam.style.color = data.camera ? "var(--ok)" : "var(--err)";
+    stStorage.textContent = data.sd
+      ? "SD 卡 (appsetting.json)"
+      : "NVS / RAM (TFT 模式)";
 
     if (!ledSyncing) setLedUI(!!data.led);
   } catch (e) {

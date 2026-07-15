@@ -42,6 +42,8 @@
 #include <HTTPClient.h> // Discord Webhook 推播通知
 #include <WebServer.h>
 #include <SPIFFS.h>
+#include <SD_MMC.h> // 板載 microSD (SD 模式儲存 appsetting.json / 告警)
+#include <cJSON.h>  // arduino-esp32 內建 (ESP-IDF json 元件)，解析/產生 appsetting.json
 #include <Preferences.h>
 #include <Update.h> // OTA：網頁上傳 .bin 更新韌體 / SPIFFS
 #include <time.h>
@@ -122,21 +124,41 @@ volatile bool motionResetBaseline = false; // 設定變更後丟棄上一幀基�
 volatile float motionDiff = 0;             // 最近一次比對的變動比例 (%)
 volatile uint32_t motionTriggeredUntilMs = 0;
 
-// ---------- 告警紀錄 (觸發時間 + 觸發當下 JPEG，存於 PSRAM 環形緩衝) ----------
-// 注意：紀錄放在 RAM，斷電/重開機即消失；SPIFFS 僅 128KB 且寫入 flash
-// 會與相機任務衝突，故不落地。
-#define MAX_ALARMS 10
+// ---------- SD 卡儲存模式 ----------
+// AI-Thinker 板載 microSD 與 ST7789 共用腳位 (SD_MMC 1-bit 需 GPIO14/15/2，
+// TFT 用 14/13/12/2)，兩者無法並存。開機自動偵測：
+//   掛載 SD 成功 -> SD 模式：TFT 停用，appsetting.json (wifi/偵測框/webhook)
+//                  與告警紀錄 (index.json + JPEG) 都存 SD，斷電保留
+//   掛載失敗     -> TFT 模式：維持原本 NVS (wifi/webhook) + PSRAM (告警)
+// 1-bit 模式只占用 GPIO14(CLK)/15(CMD)/2(D0)，GPIO4 LED 不受影響。
+// 注意：SD 模式運作時 TFT 排線需拔除，避免干擾 SD 訊號。
+#define APPSETTING_PATH "/appsetting.json"
+#define ALARM_DIR "/alarms"
+#define ALARM_INDEX_PATH "/alarms/index.json"
+
+bool sdMode = false;
+SemaphoreHandle_t sdMutex; // 序列化所有 SD 卡檔案存取 (FATFS 併發不可靠)
+String sdWifiSsid;         // SD 模式的 Wi-Fi 紀錄 (取代 NVS)
+String sdWifiPassword;
+
+// ---------- 告警紀錄 (觸發時間 + 觸發當下 JPEG) ----------
+// TFT 模式：JPEG 存 PSRAM 環形緩衝 (斷電消失，保留 10 筆)。
+// SD 模式：JPEG 寫入 /alarms/<id>.jpg + index.json (斷電保留，保留 50 筆)。
+// SPIFFS 不用來存告警：僅 128KB 且內部 flash 寫入會與相機任務衝突。
+#define MAX_ALARMS_RAM 10
+#define MAX_ALARMS_SD 50
 
 struct AlarmRec
 {
   uint32_t id;
   time_t epoch; // 觸發時間 (由網頁 POST /time 同步後才是真實時間)
-  uint8_t *jpg;
+  uint8_t *jpg; // TFT 模式：PSRAM 指標；SD 模式：NULL (內容在 SD 檔案)
   size_t len;
 };
-AlarmRec alarmList[MAX_ALARMS] = {};
+AlarmRec alarmList[MAX_ALARMS_SD] = {};
+int alarmCap = MAX_ALARMS_RAM;      // 依儲存模式在 setup() 調整
 int alarmWrite = 0;                 // 下一筆寫入位置
-int alarmCount = 0;                 // 目前保存筆數 (<= MAX_ALARMS)
+int alarmCount = 0;                 // 目前保存筆數 (<= alarmCap)
 volatile uint32_t alarmLastId = 0;  // 最新一筆 id，網頁輪詢比對用
 SemaphoreHandle_t alarmMutex;
 
@@ -160,6 +182,11 @@ void drawBellIcon(int16_t cx, int16_t cy);
 void notifyTask(void *param);
 void sendDiscordNotify(uint32_t alarmId);
 String formatEpoch(time_t epoch);
+void loadAppSettings();
+void saveAppSettings();
+void loadAlarmIndex();
+void saveAlarmIndexLocked();
+String alarmJpgPath(uint32_t id);
 String jsonEscape(const String &s);
 void handleNotifyConfigGet();
 void handleNotifyConfigSet();
@@ -199,6 +226,30 @@ void setup()
     Serial.println("SPIFFS 掛載失敗，網頁將無法載入");
   }
 
+  jpegMutex = xSemaphoreCreateMutex();
+  jpegReadySem = xSemaphoreCreateBinary();
+  motionCfgMutex = xSemaphoreCreateMutex();
+  alarmMutex = xSemaphoreCreateMutex();
+  notifyMutex = xSemaphoreCreateMutex();
+  sdMutex = xSemaphoreCreateMutex();
+  notifyQueue = xQueueCreate(5, sizeof(uint32_t));
+
+  // 自動偵測儲存模式：能掛載 microSD (1-bit) 就用 SD，否則維持 TFT + NVS/RAM
+  if (SD_MMC.begin("/sdcard", true)) // true = 1-bit 模式，只占用 GPIO14/15/2
+  {
+    sdMode = true;
+    alarmCap = MAX_ALARMS_SD;
+    SD_MMC.mkdir(ALARM_DIR);
+    loadAppSettings(); // wifi / 偵測框 / webhook
+    loadAlarmIndex();  // 還原既有告警紀錄
+    Serial.printf("SD 卡已掛載 (%.1f MB)：SD 模式，TFT 停用，設定與告警存 SD\n",
+                  SD_MMC.cardSize() / 1048576.0f);
+  }
+  else
+  {
+    Serial.println("未偵測到 SD 卡：TFT 模式，設定存 NVS，告警存 RAM");
+  }
+
   // AP + STA 同時開啟：手機可持續連著 esp32_init 這個熱點進行設定，
   // 同時 ESP32 也能以 STA 模式連上使用者選擇的 Wi-Fi。
   WiFi.mode(WIFI_AP_STA);
@@ -214,17 +265,13 @@ void setup()
 
   tryAutoConnectSavedWifi();
 
-  jpegMutex = xSemaphoreCreateMutex();
-  jpegReadySem = xSemaphoreCreateBinary();
-  motionCfgMutex = xSemaphoreCreateMutex();
-  alarmMutex = xSemaphoreCreateMutex();
-  notifyMutex = xSemaphoreCreateMutex();
-  notifyQueue = xQueueCreate(5, sizeof(uint32_t));
-
-  // 讀取已儲存的 Discord Webhook
-  notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, true);
-  discordWebhook = notifyPrefs.getString("webhook", "");
-  notifyPrefs.end();
+  // TFT 模式才從 NVS 讀 Webhook (SD 模式已由 appsetting.json 載入)
+  if (!sdMode)
+  {
+    notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, true);
+    discordWebhook = notifyPrefs.getString("webhook", "");
+    notifyPrefs.end();
+  }
   if (discordWebhook.length() > 0)
   {
     Serial.println("Discord 推播已設定");
@@ -282,14 +329,21 @@ void loop()
 
 void cameraTask(void *param)
 {
-  tft.init();
-  tft.setRotation(1); // 0~3，順時針旋轉 90°
+  // SD 模式下 TFT 腳位被 SD_MMC 占用，完全不碰 TFT
+  if (!sdMode)
+  {
+    tft.init();
+    tft.setRotation(1); // 0~3，順時針旋轉 90°
+  }
 
   if (!initCamera())
   {
-    tft.setCursor(10, 100);
-    tft.setTextColor(TFT_RED);
-    tft.println("Camera init failed!");
+    if (!sdMode)
+    {
+      tft.setCursor(10, 100);
+      tft.setTextColor(TFT_RED);
+      tft.println("Camera init failed!");
+    }
     vTaskDelete(NULL);
     return;
   }
@@ -325,16 +379,22 @@ void cameraTask(void *param)
       // 相機實際協商出的解析度不一定剛好是 240x240，置中顯示避免因尺寸不符而整張跳過
       int16_t x = (TFT_WIDTH - fb->width) / 2;
       int16_t y = (TFT_HEIGHT - fb->height) / 2;
-      tft.startWrite();
-      tft.setAddrWindow(x, y, fb->width, fb->height);
-      tft.pushPixels((uint16_t *)fb->buf, fb->len / 2);
-      tft.endWrite();
+      if (!sdMode)
+      {
+        tft.startWrite();
+        tft.setAddrWindow(x, y, fb->width, fb->height);
+        tft.pushPixels((uint16_t *)fb->buf, fb->len / 2);
+        tft.endWrite();
+      }
 
-      // 移動偵測在裝置端逐幀進行，瀏覽器關掉也持續監控
+      // 移動偵測在裝置端逐幀進行，瀏覽器關掉也持續監控 (SD 模式亦然)
       detectMotionOnFrame(fb);
 
-      // 疊加偵測框 (綠=監控/紅=觸發) 與觸發鈴鐺；下一幀影像會蓋掉重畫
-      drawMotionOverlayOnTft(x, y);
+      if (!sdMode)
+      {
+        // 疊加偵測框 (綠=監控/紅=觸發) 與觸發鈴鐺；下一幀影像會蓋掉重畫
+        drawMotionOverlayOnTft(x, y);
+      }
     }
 
     // 網頁 /capture 有人在等快照時，才把這一幀轉成 JPEG (約數十 ms)，
@@ -479,7 +539,8 @@ void detectMotionOnFrame(camera_fb_t *fb)
   prevValid = true;
 }
 
-// 觸發告警：把當下畫面轉 JPEG 存進 PSRAM 環形緩衝 (滿了覆蓋最舊一筆)
+// 觸發告警：把當下畫面轉 JPEG 存進環形緩衝 (滿了覆蓋最舊一筆)。
+// TFT 模式存 PSRAM；SD 模式寫入 /alarms/<id>.jpg 並更新 index.json。
 void addAlarmRecord(camera_fb_t *fb)
 {
   uint8_t *out = NULL;
@@ -489,31 +550,69 @@ void addAlarmRecord(camera_fb_t *fb)
     Serial.println("告警擷取失敗：frame2jpg 錯誤");
     return;
   }
-  // frame2jpg 配置在內部 RAM，複製到 PSRAM 保存以免排擠 WiFi 堆疊
-  uint8_t *copy = (uint8_t *)ps_malloc(outLen);
-  if (!copy)
+
+  uint8_t *copy = NULL;
+  if (!sdMode)
   {
-    free(out);
-    Serial.println("告警擷取失敗：PSRAM 配置失敗");
-    return;
+    // frame2jpg 配置在內部 RAM，複製到 PSRAM 保存以免排擠 WiFi 堆疊
+    copy = (uint8_t *)ps_malloc(outLen);
+    if (!copy)
+    {
+      free(out);
+      Serial.println("告警擷取失敗：PSRAM 配置失敗");
+      return;
+    }
+    memcpy(copy, out, outLen);
   }
-  memcpy(copy, out, outLen);
-  free(out);
 
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
   AlarmRec *rec = &alarmList[alarmWrite];
+  uint32_t id = alarmLastId + 1;
+
+  bool stored = true;
+  if (sdMode)
+  {
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    if (rec->id != 0)
+    {
+      SD_MMC.remove(alarmJpgPath(rec->id)); // 環形覆蓋：先刪被淘汰的舊檔
+    }
+    File f = SD_MMC.open(alarmJpgPath(id), FILE_WRITE);
+    if (f)
+    {
+      stored = f.write(out, outLen) == outLen;
+      f.close();
+    }
+    else
+    {
+      stored = false;
+    }
+    xSemaphoreGive(sdMutex);
+  }
+  free(out);
+
+  if (!stored)
+  {
+    xSemaphoreGive(alarmMutex);
+    Serial.println("告警擷取失敗：SD 卡寫入失敗");
+    return;
+  }
+
   if (rec->jpg)
   {
-    free(rec->jpg);
+    free(rec->jpg); // TFT 模式：釋放被覆蓋的舊 JPEG
   }
-  uint32_t id = alarmLastId + 1;
   rec->id = id;
   rec->epoch = time(NULL);
-  rec->jpg = copy;
+  rec->jpg = copy; // SD 模式為 NULL，內容在 SD 檔案
   rec->len = outLen;
   alarmLastId = id;
-  alarmWrite = (alarmWrite + 1) % MAX_ALARMS;
-  if (alarmCount < MAX_ALARMS) alarmCount++;
+  alarmWrite = (alarmWrite + 1) % alarmCap;
+  if (alarmCount < alarmCap) alarmCount++;
+  if (sdMode)
+  {
+    saveAlarmIndexLocked();
+  }
   xSemaphoreGive(alarmMutex);
 
   // 交給通知任務推播 Discord (佇列滿了就放棄這則，不能卡住相機任務)
@@ -614,6 +713,7 @@ void sendDiscordNotify(uint32_t alarmId)
   }
 
   // 取出告警 JPEG 副本，避免傳送期間環形緩衝被覆蓋
+  // (TFT 模式從 PSRAM 複製；SD 模式從 SD 檔案讀入)
   uint8_t *jpg = NULL;
   size_t jpgSize = 0;
   time_t epoch = time(NULL);
@@ -622,17 +722,42 @@ void sendDiscordNotify(uint32_t alarmId)
     xSemaphoreTake(alarmMutex, portMAX_DELAY);
     for (int i = 0; i < alarmCount; i++)
     {
-      if (alarmList[i].id == alarmId && alarmList[i].jpg)
+      if (alarmList[i].id != alarmId)
+      {
+        continue;
+      }
+      epoch = alarmList[i].epoch;
+      if (alarmList[i].jpg)
       {
         jpg = (uint8_t *)ps_malloc(alarmList[i].len);
         if (jpg)
         {
           memcpy(jpg, alarmList[i].jpg, alarmList[i].len);
           jpgSize = alarmList[i].len;
-          epoch = alarmList[i].epoch;
         }
-        break;
       }
+      else if (sdMode)
+      {
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        File f = SD_MMC.open(alarmJpgPath(alarmId), FILE_READ);
+        if (f)
+        {
+          size_t fsize = f.size();
+          jpg = (uint8_t *)ps_malloc(fsize);
+          if (jpg && f.read(jpg, fsize) == fsize)
+          {
+            jpgSize = fsize;
+          }
+          else if (jpg)
+          {
+            free(jpg);
+            jpg = NULL;
+          }
+          f.close();
+        }
+        xSemaphoreGive(sdMutex);
+      }
+      break;
     }
     xSemaphoreGive(alarmMutex);
   }
@@ -694,6 +819,214 @@ void sendDiscordNotify(uint32_t alarmId)
   free(body);
 }
 
+// ================= SD 卡儲存 (appsetting.json / 告警索引) =================
+
+String alarmJpgPath(uint32_t id)
+{
+  return String(ALARM_DIR) + "/" + String(id) + ".jpg";
+}
+
+// 讀取 /appsetting.json：wifi 設定紀錄、偵測框座標紀錄、Discord webhook。
+// 僅在 setup() 單執行緒階段呼叫，直接寫全域變數不需鎖。
+void loadAppSettings()
+{
+  File f = SD_MMC.open(APPSETTING_PATH, FILE_READ);
+  if (!f)
+  {
+    Serial.println("SD 無 appsetting.json，將於首次設定時建立");
+    return;
+  }
+  String raw = f.readString();
+  f.close();
+
+  cJSON *root = cJSON_Parse(raw.c_str());
+  if (!root)
+  {
+    Serial.println("appsetting.json 解析失敗，忽略");
+    return;
+  }
+
+  cJSON *wifi = cJSON_GetObjectItem(root, "wifi");
+  if (wifi)
+  {
+    cJSON *it = cJSON_GetObjectItem(wifi, "ssid");
+    if (cJSON_IsString(it)) sdWifiSsid = it->valuestring;
+    it = cJSON_GetObjectItem(wifi, "password");
+    if (cJSON_IsString(it)) sdWifiPassword = it->valuestring;
+  }
+
+  cJSON *motion = cJSON_GetObjectItem(root, "motion");
+  if (motion)
+  {
+    MotionConfig cfg = motionCfg;
+    cJSON *it = cJSON_GetObjectItem(motion, "enabled");
+    if (cJSON_IsBool(it)) cfg.enabled = cJSON_IsTrue(it);
+    it = cJSON_GetObjectItem(motion, "x");
+    if (cJSON_IsNumber(it)) cfg.x = it->valueint;
+    it = cJSON_GetObjectItem(motion, "y");
+    if (cJSON_IsNumber(it)) cfg.y = it->valueint;
+    it = cJSON_GetObjectItem(motion, "w");
+    if (cJSON_IsNumber(it)) cfg.w = it->valueint;
+    it = cJSON_GetObjectItem(motion, "h");
+    if (cJSON_IsNumber(it)) cfg.h = it->valueint;
+    it = cJSON_GetObjectItem(motion, "sens");
+    if (cJSON_IsNumber(it)) cfg.sensitivity = it->valueint;
+
+    // 邊界防呆：檔案可能被手動編輯過
+    cfg.x = constrain(cfg.x, 0, TFT_WIDTH - 1);
+    cfg.y = constrain(cfg.y, 0, TFT_HEIGHT - 1);
+    cfg.w = constrain(cfg.w, 0, TFT_WIDTH - cfg.x);
+    cfg.h = constrain(cfg.h, 0, TFT_HEIGHT - cfg.y);
+    if (cfg.sensitivity < 1 || cfg.sensitivity > 15) cfg.sensitivity = 4;
+    if (cfg.w < 8 || cfg.h < 8) cfg.enabled = false;
+    motionCfg = cfg;
+  }
+
+  cJSON *notify = cJSON_GetObjectItem(root, "notify");
+  if (notify)
+  {
+    cJSON *it = cJSON_GetObjectItem(notify, "webhook");
+    if (cJSON_IsString(it)) discordWebhook = it->valuestring;
+  }
+
+  cJSON_Delete(root);
+  Serial.println("已載入 appsetting.json");
+}
+
+// 把目前設定寫回 /appsetting.json (wifi / 偵測框 / webhook)
+void saveAppSettings()
+{
+  if (!sdMode)
+  {
+    return;
+  }
+
+  xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
+  MotionConfig cfg = motionCfg;
+  xSemaphoreGive(motionCfgMutex);
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  String webhook = discordWebhook;
+  xSemaphoreGive(notifyMutex);
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
+  cJSON_AddStringToObject(wifi, "ssid", sdWifiSsid.c_str());
+  cJSON_AddStringToObject(wifi, "password", sdWifiPassword.c_str());
+  cJSON *motion = cJSON_AddObjectToObject(root, "motion");
+  cJSON_AddBoolToObject(motion, "enabled", cfg.enabled);
+  cJSON_AddNumberToObject(motion, "x", cfg.x);
+  cJSON_AddNumberToObject(motion, "y", cfg.y);
+  cJSON_AddNumberToObject(motion, "w", cfg.w);
+  cJSON_AddNumberToObject(motion, "h", cfg.h);
+  cJSON_AddNumberToObject(motion, "sens", cfg.sensitivity);
+  cJSON *notify = cJSON_AddObjectToObject(root, "notify");
+  cJSON_AddStringToObject(notify, "webhook", webhook.c_str());
+
+  char *text = cJSON_Print(root); // 含縮排排版，可直接用電腦開卡檢視/編輯
+  cJSON_Delete(root);
+  if (!text)
+  {
+    Serial.println("appsetting.json 產生失敗");
+    return;
+  }
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  File f = SD_MMC.open(APPSETTING_PATH, FILE_WRITE);
+  bool ok = false;
+  if (f)
+  {
+    ok = f.print(text) > 0;
+    f.close();
+  }
+  xSemaphoreGive(sdMutex);
+  cJSON_free(text);
+  if (!ok)
+  {
+    Serial.println("appsetting.json 寫入失敗");
+  }
+}
+
+// 開機還原 /alarms/index.json -> RAM 環形索引 (JPEG 內容留在 SD 檔案)
+void loadAlarmIndex()
+{
+  File f = SD_MMC.open(ALARM_INDEX_PATH, FILE_READ);
+  if (!f)
+  {
+    return;
+  }
+  String raw = f.readString();
+  f.close();
+
+  cJSON *root = cJSON_Parse(raw.c_str());
+  if (!root)
+  {
+    return;
+  }
+
+  cJSON *arr = cJSON_GetObjectItem(root, "alarms");
+  int n = cJSON_GetArraySize(arr); // arr 為 NULL 時回傳 0
+  int start = n > alarmCap ? n - alarmCap : 0; // 超量只取最新 alarmCap 筆
+  for (int i = start; i < n; i++)
+  {
+    cJSON *item = cJSON_GetArrayItem(arr, i);
+    cJSON *idIt = cJSON_GetObjectItem(item, "id");
+    if (!cJSON_IsNumber(idIt))
+    {
+      continue;
+    }
+    AlarmRec *rec = &alarmList[alarmWrite];
+    rec->id = (uint32_t)idIt->valuedouble;
+    cJSON *tIt = cJSON_GetObjectItem(item, "time");
+    rec->epoch = cJSON_IsNumber(tIt) ? (time_t)tIt->valuedouble : 0;
+    cJSON *lIt = cJSON_GetObjectItem(item, "len");
+    rec->len = cJSON_IsNumber(lIt) ? (size_t)lIt->valuedouble : 0;
+    rec->jpg = NULL;
+    if (rec->id > alarmLastId)
+    {
+      alarmLastId = rec->id;
+    }
+    alarmWrite = (alarmWrite + 1) % alarmCap;
+    if (alarmCount < alarmCap)
+    {
+      alarmCount++;
+    }
+  }
+  cJSON_Delete(root);
+  Serial.printf("已從 SD 還原 %d 筆告警紀錄\n", alarmCount);
+}
+
+// 將 RAM 索引寫回 index.json (由最舊到最新)；呼叫者需已持有 alarmMutex
+void saveAlarmIndexLocked()
+{
+  cJSON *root = cJSON_CreateObject();
+  cJSON *arr = cJSON_AddArrayToObject(root, "alarms");
+  for (int i = 0; i < alarmCount; i++)
+  {
+    int idx = ((alarmWrite - alarmCount + i) % alarmCap + alarmCap) % alarmCap;
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddNumberToObject(item, "id", alarmList[idx].id);
+    cJSON_AddNumberToObject(item, "time", (double)(uint32_t)alarmList[idx].epoch);
+    cJSON_AddNumberToObject(item, "len", (double)alarmList[idx].len);
+    cJSON_AddItemToArray(arr, item);
+  }
+  char *text = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!text)
+  {
+    return;
+  }
+
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
+  File f = SD_MMC.open(ALARM_INDEX_PATH, FILE_WRITE);
+  if (f)
+  {
+    f.print(text);
+    f.close();
+  }
+  xSemaphoreGive(sdMutex);
+  cJSON_free(text);
+}
+
 // ================= Web Server 處理函式 =================
 
 String jsonEscape(const String &s)
@@ -753,10 +1086,19 @@ void handleConnect()
   String ssid = server.arg("ssid");
   String password = server.hasArg("password") ? server.arg("password") : "";
 
-  wifiPrefs.begin(WIFI_PREF_NAMESPACE, false);
-  wifiPrefs.putString("ssid", ssid);
-  wifiPrefs.putString("password", password);
-  wifiPrefs.end();
+  if (sdMode)
+  {
+    sdWifiSsid = ssid;
+    sdWifiPassword = password;
+    saveAppSettings();
+  }
+  else
+  {
+    wifiPrefs.begin(WIFI_PREF_NAMESPACE, false);
+    wifiPrefs.putString("ssid", ssid);
+    wifiPrefs.putString("password", password);
+    wifiPrefs.end();
+  }
 
   WiFi.begin(ssid.c_str(), password.c_str());
   staConnecting = true;
@@ -775,6 +1117,7 @@ void handleStatus()
   json += ",\"ssid\":\"" + jsonEscape(connected ? WiFi.SSID() : String("")) + "\"";
   json += ",\"led\":" + String(ledState ? "true" : "false");
   json += ",\"camera\":" + String(cameraOk ? "true" : "false");
+  json += ",\"sd\":" + String(sdMode ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -807,9 +1150,18 @@ void handleCapture()
 
 void handleClearWifi()
 {
-  wifiPrefs.begin(WIFI_PREF_NAMESPACE, false);
-  wifiPrefs.clear();
-  wifiPrefs.end();
+  if (sdMode)
+  {
+    sdWifiSsid = "";
+    sdWifiPassword = "";
+    saveAppSettings();
+  }
+  else
+  {
+    wifiPrefs.begin(WIFI_PREF_NAMESPACE, false);
+    wifiPrefs.clear();
+    wifiPrefs.end();
+  }
 
   staConnecting = false;
   // 只斷開 STA 並清除 WiFi 函式庫內部記住的 AP 資訊，softAP (esp32_init) 保持運作，
@@ -843,6 +1195,8 @@ void handleMotionConfig()
   xSemaphoreGive(motionCfgMutex);
   motionTriggeredUntilMs = 0;
 
+  saveAppSettings(); // SD 模式：偵測框座標即時寫入 appsetting.json (重開機保留)
+
   Serial.printf("移動偵測設定: %s 區域(%d,%d %dx%d) 靈敏度=%d\n",
                 enabled ? "啟用" : "停用", x, y, w, h, sens);
   server.send(200, "application/json", "{\"ok\":true}");
@@ -875,7 +1229,7 @@ void handleAlarmList()
   String json = "[";
   for (int i = 0; i < alarmCount; i++)
   {
-    int idx = (alarmWrite - 1 - i + MAX_ALARMS * 2) % MAX_ALARMS;
+    int idx = ((alarmWrite - 1 - i) % alarmCap + alarmCap) % alarmCap;
     if (i > 0) json += ",";
     json += "{\"id\":" + String(alarmList[idx].id) +
             ",\"time\":" + String((uint32_t)alarmList[idx].epoch) + "}";
@@ -888,6 +1242,24 @@ void handleAlarmList()
 void handleAlarmImage()
 {
   uint32_t id = (uint32_t)server.arg("id").toInt();
+
+  if (sdMode)
+  {
+    // SD 模式：JPEG 在 SD 檔案，直接串流回瀏覽器
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+    File f = SD_MMC.open(alarmJpgPath(id), FILE_READ);
+    if (f)
+    {
+      server.sendHeader("Cache-Control", "max-age=3600"); // id 唯一，可放心快取
+      server.streamFile(f, "image/jpeg");
+      f.close();
+      xSemaphoreGive(sdMutex);
+      return;
+    }
+    xSemaphoreGive(sdMutex);
+    server.send(404, "application/json", "{\"error\":\"alarm not found\"}");
+    return;
+  }
 
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
   for (int i = 0; i < alarmCount; i++)
@@ -908,8 +1280,14 @@ void handleAlarmImage()
 void handleAlarmClear()
 {
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
-  for (int i = 0; i < MAX_ALARMS; i++)
+  for (int i = 0; i < alarmCap; i++)
   {
+    if (sdMode && alarmList[i].id != 0)
+    {
+      xSemaphoreTake(sdMutex, portMAX_DELAY);
+      SD_MMC.remove(alarmJpgPath(alarmList[i].id));
+      xSemaphoreGive(sdMutex);
+    }
     if (alarmList[i].jpg)
     {
       free(alarmList[i].jpg);
@@ -918,6 +1296,10 @@ void handleAlarmClear()
   }
   alarmWrite = 0;
   alarmCount = 0;
+  if (sdMode)
+  {
+    saveAlarmIndexLocked();
+  }
   xSemaphoreGive(alarmMutex);
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -960,13 +1342,20 @@ void handleNotifyConfigSet()
     return;
   }
 
-  notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, false);
-  notifyPrefs.putString("webhook", url);
-  notifyPrefs.end();
-
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   discordWebhook = url;
   xSemaphoreGive(notifyMutex);
+
+  if (sdMode)
+  {
+    saveAppSettings();
+  }
+  else
+  {
+    notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, false);
+    notifyPrefs.putString("webhook", url);
+    notifyPrefs.end();
+  }
 
   Serial.println(url.length() > 0 ? "Discord Webhook 已更新" : "Discord Webhook 已清除");
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1079,10 +1468,19 @@ void handleLed()
 
 void tryAutoConnectSavedWifi()
 {
-  wifiPrefs.begin(WIFI_PREF_NAMESPACE, true);
-  String ssid = wifiPrefs.getString("ssid", "");
-  String password = wifiPrefs.getString("password", "");
-  wifiPrefs.end();
+  String ssid, password;
+  if (sdMode)
+  {
+    ssid = sdWifiSsid;
+    password = sdWifiPassword;
+  }
+  else
+  {
+    wifiPrefs.begin(WIFI_PREF_NAMESPACE, true);
+    ssid = wifiPrefs.getString("ssid", "");
+    password = wifiPrefs.getString("password", "");
+    wifiPrefs.end();
+  }
 
   if (ssid.length() > 0)
   {

@@ -60,6 +60,10 @@
             <span class="k">相機</span><span class="v" id="stCam">--</span>
           </div>
           <div class="kv">
+            <span class="k">資料儲存</span
+            ><span class="v" id="stStorage">--</span>
+          </div>
+          <div class="kv">
             <span class="k">熱點</span
             ><span class="v">esp32_init / 192.168.4.1</span>
           </div>
@@ -206,8 +210,10 @@
           </div>
           <div id="alarmListEl" class="alarm-list"></div>
           <p class="muted" style="margin: 12px 0 0">
-            保留最近 10 筆（觸發時間 +
-            觸發當下擷取影像），儲存於裝置記憶體，斷電或重新啟動後清空。點選影像可開新分頁檢視原圖。
+            每筆紀錄含觸發時間 + 觸發當下擷取影像，點選影像可開新分頁檢視原圖。
+            SD 模式（開機時插入 microSD）：存於 SD 卡 /alarms，保留最近 50
+            筆，斷電保留；TFT 模式：存於裝置記憶體，保留最近 10
+            筆，斷電或重新啟動後清空。
           </p>
         </div>
       </section>

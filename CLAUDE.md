@@ -87,10 +87,26 @@ Setup24_ST7789.h 設定
     - ST7789 同步顯示：TFT 串流畫面每幀疊加偵測框（綠 = 監控、紅 = 觸發，與網頁一致），
       觸發時右上角顯示黃色小鈴鐺（用 TFT 基本圖形拼出，觸發保持 1.5 秒）
   - 告警紀錄：移動偵測觸發時韌體自動以 frame2jpg 擷取當下畫面
-    - 每筆紀錄含觸發時間 + 觸發擷取圖片，存於 PSRAM 環形緩衝（保留最近 10 筆，滿了覆蓋最舊；斷電/重啟即清空）
+    - 每筆紀錄含觸發時間 + 觸發擷取圖片；儲存位置依儲存模式而定（見下方「資料儲存模式」）
     - 兩筆告警最小間隔 5 秒，避免連續移動灌爆紀錄
     - GET `/alarms` 回傳清單（新到舊）、GET `/alarm/img?id=N` 回傳 JPEG、POST `/alarm/clear` 清除全部
     - 觸發時間由網頁載入時 POST `/time`（瀏覽器 epoch）同步到裝置（AP 模式無 NTP）；未同步前的紀錄顯示「時間未同步」
+
+## 資料儲存模式（開機自動偵測 SD 卡）
+
+AI-Thinker 板載 microSD 與 ST7789 共用腳位（SD_MMC 1-bit 需 GPIO14/15/2，TFT 用 14/13/12/2），
+兩者無法並存。開機時自動偵測（`/status` 的 `sd` 欄位、控制台「資料儲存」列可查看目前模式）：
+
+- **SD 模式**：`SD_MMC.begin("/sdcard", true)`（1-bit）掛載成功
+  - TFT 完全停用（**接 SD 卡時 TFT 排線需拔除**，避免干擾訊號）；GPIO4 LED 不受影響（1-bit 不用 D1）
+  - 後端資料庫 `/appsetting.json`（cJSON 排版輸出，可用電腦直接開卡編輯）：
+    - `wifi.ssid / wifi.password`：Wi-Fi 設定紀錄（取代 NVS）
+    - `motion.enabled / x / y / w / h / sens`：偵測框座標紀錄（開機自動還原並開始偵測）
+    - `notify.webhook`：Discord Webhook
+  - 告警紀錄存 `/alarms/<id>.jpg` + `/alarms/index.json`，保留最近 50 筆（環形覆蓋最舊），斷電保留
+  - 所有 SD 檔案存取以 `sdMutex` 序列化，鎖順序固定 alarmMutex → sdMutex
+- **TFT 模式**：無 SD 卡（維持原本行為）
+  - Wi-Fi / Webhook 存 NVS（Preferences），偵測框僅存 RAM（重開機需重設），告警存 PSRAM 保留 10 筆（斷電清空）
   - OTA 更新：上傳 .bin 無線更新（POST `/update?target=firmware|spiffs`，使用 Update.h）
     - target=firmware：韌體 .bin（Arduino IDE「Sketch > Export Compiled Binary」）
     - target=spiffs：SPIFFS 映像檔（mkspiffs 打包 `data` 資料夾），可免拉線更新網頁
