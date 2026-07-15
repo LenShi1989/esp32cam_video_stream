@@ -72,7 +72,9 @@ Setup24_ST7789.h 設定
     - 輸入 SSID + PASSWORD 送出連線（POST `/connect`，同時存入 NVS，下次開機自動嘗試重連）
     - 清除 SSID 按鍵（POST `/clear`，清除 NVS 設定並斷開 STA，熱點保持開啟可重新設定）
   - 影像串流：瀏覽器輪詢 GET `/capture`（相機任務將 RGB565 幀以 frame2jpg 轉 JPEG 快照回傳）顯示即時影像
+    - 旋轉按鈕：0°/90°/180°/270° 循環切換（瀏覽器端 canvas 旋轉，與移動偵測共用角度，存 localStorage）
   - 移動偵測：在影像上拖曳框選偵測區域，瀏覽器端做畫格差異比對；綠框 = 正常、紅框 = 已觸發，附靈敏度調整
+    - 同樣有旋轉按鈕；偵測取樣直接來自已旋轉的畫布，框選座標與顯示畫面一致，切換角度時會重置比對基準
   - OTA 更新：上傳 .bin 無線更新（POST `/update?target=firmware|spiffs`，使用 Update.h）
     - target=firmware：韌體 .bin（Arduino IDE「Sketch > Export Compiled Binary」）
     - target=spiffs：SPIFFS 映像檔（mkspiffs 打包 `data` 資料夾），可免拉線更新網頁

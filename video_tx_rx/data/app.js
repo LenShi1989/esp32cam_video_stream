@@ -218,6 +218,39 @@ streamToggleBtn.addEventListener("click", () => {
   streamToggleBtn.textContent = streamPaused ? "繼續" : "暫停";
 });
 
+// ---------- 影像旋轉 ----------
+// 影像串流與移動偵測共用同一個旋轉角度 (0/90/180/270)，
+// 存在 localStorage，重新整理後保留設定。
+const streamRotateBtn = document.getElementById("streamRotateBtn");
+const motionRotateBtn = document.getElementById("motionRotateBtn");
+
+let rotateDeg = Number(localStorage.getItem("rotateDeg")) || 0;
+if (![0, 90, 180, 270].includes(rotateDeg)) rotateDeg = 0;
+
+function updateRotateUI() {
+  streamRotateBtn.textContent = "旋轉 " + rotateDeg + "°";
+  motionRotateBtn.textContent = "旋轉 " + rotateDeg + "°";
+}
+updateRotateUI();
+
+function cycleRotate() {
+  rotateDeg = (rotateDeg + 90) % 360;
+  localStorage.setItem("rotateDeg", rotateDeg);
+  updateRotateUI();
+  prevGray = null; // 旋轉後畫面內容改變，重置偵測基準避免誤判
+}
+streamRotateBtn.addEventListener("click", cycleRotate);
+motionRotateBtn.addEventListener("click", cycleRotate);
+
+// 以畫布中心旋轉繪製影像 (畫布與影像皆為 240x240 正方形)
+function drawRotated(ctx, bmp, w, h) {
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate((rotateDeg * Math.PI) / 180);
+  ctx.drawImage(bmp, -w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+
 async function frameLoop() {
   for (;;) {
     const wantStream =
@@ -234,15 +267,15 @@ async function frameLoop() {
       const bmp = await createImageBitmap(blob);
 
       if (wantStream) {
-        streamCtx.drawImage(bmp, 0, 0, streamCanvas.width, streamCanvas.height);
+        drawRotated(streamCtx, bmp, streamCanvas.width, streamCanvas.height);
         const now = performance.now();
         frameTimes.push(now);
         frameTimes = frameTimes.filter((t) => now - t < 2000);
         streamHud.textContent = "FPS " + (frameTimes.length / 2).toFixed(1);
       }
       if (wantMotion) {
-        motionCtx.drawImage(bmp, 0, 0, motionCanvas.width, motionCanvas.height);
-        detectMotion(bmp);
+        drawRotated(motionCtx, bmp, motionCanvas.width, motionCanvas.height);
+        detectMotion();
       }
       bmp.close();
     } catch (e) {
@@ -317,7 +350,7 @@ motionClearBtn.addEventListener("click", () => {
   drawOverlay();
 });
 
-function detectMotion(bmp) {
+function detectMotion() {
   if (!region) {
     motionBadge.className = "badge";
     motionBadge.textContent = "未設定區域";
@@ -325,12 +358,19 @@ function detectMotion(bmp) {
     return;
   }
 
-  // 只取框選區域，縮到 SAMPLE x SAMPLE 後轉灰階與上一幀比較
-  const sx = (region.x / motionCanvas.width) * bmp.width;
-  const sy = (region.y / motionCanvas.height) * bmp.height;
-  const sw = (region.w / motionCanvas.width) * bmp.width;
-  const sh = (region.h / motionCanvas.height) * bmp.height;
-  sampleCtx.drawImage(bmp, sx, sy, sw, sh, 0, 0, SAMPLE, SAMPLE);
+  // 直接從已套用旋轉的 motionCanvas 取框選區域 (座標系一致)，
+  // 縮到 SAMPLE x SAMPLE 後轉灰階與上一幀比較
+  sampleCtx.drawImage(
+    motionCanvas,
+    region.x,
+    region.y,
+    region.w,
+    region.h,
+    0,
+    0,
+    SAMPLE,
+    SAMPLE,
+  );
   const img = sampleCtx.getImageData(0, 0, SAMPLE, SAMPLE).data;
 
   const gray = new Uint8Array(SAMPLE * SAMPLE);
