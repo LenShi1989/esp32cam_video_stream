@@ -101,7 +101,9 @@ Setup24_ST7789.h 設定
     - 格式為 MJPEG-AVI（ESP32 無 H.264 硬體編碼器，做不出真正的 .mp4），10fps，約 15~18MB/段
     - 檔名 `日期_時間_.avi`（如 `20260716_143005_.avi`，時間未同步時為 `notime_開機秒數_.avi`），存於 SD 卡 `/rec`
     - 由 cameraTask (core 0) 逐幀 frame2jpg 寫入，結束時回填 AVI 檔頭與 idx1 索引；
-      錄影中再次觸發忽略；SD 剩餘空間 < 32MB 時略過；OTA 開始時先收尾關檔
+      SD 剩餘空間 < 32MB 時略過；OTA 開始時先收尾關檔
+    - 錄影中 (`recording` 為 true) 期間再偵測到移動只更新紅框/DIFF%，不會再截圖存告警紀錄、
+      也不會再推播 Discord/Telegram（避免 2 分鐘內灌爆告警與通知）；錄影結束後才恢復正常觸發偵測
   - 錄影回放（側邊欄頁面）：列出 `/rec` 錄影檔（GET `/recordings`），網頁播放器以串流方式下載
     （GET `/rec/file?name=`，分塊讀取避免卡住錄影寫入）並掃描 JPEG 幀（FFD8~FFD9）繪至 canvas，
     10fps 播放、支援目前旋轉角度；可刪除檔案（POST `/rec/delete?name=`，錄影中禁止刪除）；

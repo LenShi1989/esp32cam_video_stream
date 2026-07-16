@@ -626,11 +626,13 @@ void detectMotionOnFrame(camera_fb_t *fb)
     if (ratio > (float)(16 - cfg.sensitivity))
     {
       motionTriggeredUntilMs = millis() + MOTION_TRIGGER_HOLD_MS;
-      if (lastAlarmMs == 0 || millis() - lastAlarmMs > MOTION_COOLDOWN_MS)
+      // 錄影中不再截圖告警、不再推播通知，只保留紅框/DIFF% 顯示；
+      // 錄影結束 (recording 變 false) 後才繼續正常觸發偵測
+      if (!recording && (lastAlarmMs == 0 || millis() - lastAlarmMs > MOTION_COOLDOWN_MS))
       {
         lastAlarmMs = millis();
         addAlarmRecord(fb);
-        if (sdMode && !recording)
+        if (sdMode)
         {
           recordRequested = true; // 觸發後錄影 2 分鐘 (錄影中再觸發則忽略)
         }
