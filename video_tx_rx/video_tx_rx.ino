@@ -41,6 +41,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h> // Discord Webhook 推播通知
 #include <WebServer.h>
+#include <DNSServer.h> // 配合 captive portal：DNS 全導向 AP IP，讓手機/電腦連上熱點時自動彈出瀏覽器
 #include <SPIFFS.h>
 #include <SD_MMC.h> // 板載 microSD (SD 模式儲存 appsetting.json / 告警)
 #include <cJSON.h>  // arduino-esp32 內建 (ESP-IDF json 元件)，解析/產生 appsetting.json
@@ -77,9 +78,11 @@
 #define AP_SSID "esp32_init"
 #define WIFI_PREF_NAMESPACE "wifi"
 static const unsigned long STA_CONNECT_TIMEOUT_MS = 15000;
+static const byte DNS_PORT = 53;
 
 TFT_eSPI tft = TFT_eSPI();
 WebServer server(80);
+DNSServer dnsServer; // 所有網域查詢導向 AP IP，觸發手機/電腦的 captive portal 自動開瀏覽器
 Preferences wifiPrefs;
 
 volatile bool ledState = false;
@@ -221,6 +224,7 @@ void handleNotifyConfigGet();
 void handleNotifyConfigSet();
 void handleNotifyTest();
 void handleRoot();
+void handleCaptivePortal();
 void handleScan();
 void handleConnect();
 void handleStatus();
@@ -292,6 +296,11 @@ void setup()
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
+  // DNS 全導向 AP IP：手機/電腦連上 esp32_init 熱點時，系統的 captive portal
+  // 偵測請求 (如 connectivitycheck.gstatic.com、captive.apple.com) 會被導到本機，
+  // 收到非預期回應後系統即自動彈出瀏覽器視窗導向設定頁。
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
   tryAutoConnectSavedWifi();
 
   // TFT 模式才從 NVS 讀 Webhook (SD 模式已由 appsetting.json 載入)
@@ -328,6 +337,7 @@ void setup()
   server.on("/rec/delete", HTTP_POST, handleRecDelete);
   server.on("/time", HTTP_POST, handleTimeSync);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
+  server.onNotFound(handleCaptivePortal);
   server.begin();
   Serial.println("Web Server 已啟動 (core 1)");
 
@@ -340,6 +350,7 @@ void setup()
 void loop()
 {
   server.handleClient();
+  dnsServer.processNextRequest();
 
   if (staConnecting)
   {
@@ -1312,6 +1323,23 @@ void handleRoot()
   }
   server.streamFile(f, "text/html");
   f.close();
+}
+
+// 攔截所有未註冊的路徑 (server.onNotFound)。手機/電腦連上 esp32_init 熱點後
+// 會發出各種 captive portal 偵測請求 (connectivitycheck.gstatic.com/generate_204、
+// captive.apple.com/hotspot-detect.html、msftconnecttest.com/connecttest.txt 等)，
+// 這些網域經 dnsServer 全部解析到 AP IP，request 進來時 Host 不是 AP IP 本身，
+// 一律回 302 導回首頁，系統偵測到非預期回應即視為 captive portal 並自動彈出瀏覽器。
+void handleCaptivePortal()
+{
+  String apIp = WiFi.softAPIP().toString();
+  if (server.hostHeader() != apIp)
+  {
+    server.sendHeader("Location", "http://" + apIp + "/", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
+  server.send(404, "text/plain", "Not Found");
 }
 
 void handleScan()

@@ -64,6 +64,11 @@ Setup24_ST7789.h 設定
 
 - ESP32 開 AP
   - SSID：`esp32_init`（開放網路，無密碼）
+  - Captive portal 自動開瀏覽器：`dnsServer`（DNSServer）將 AP 網段內所有 DNS 查詢導向 AP IP，
+    並以 `server.onNotFound` 攔截 Host 非 AP IP 的請求（如手機/電腦連上熱點後自動送出的
+    `connectivitycheck.gstatic.com`、`captive.apple.com`、`msftconnecttest.com` 偵測請求），
+    一律回 302 導回 `/`；作業系統偵測到非預期回應即視為 captive portal，
+    連上 `esp32_init` 熱點後會自動彈出瀏覽器導向設定頁，不必手動輸入 `192.168.4.1`
 - 網頁為科技風深色介面，側邊欄分四個頁面：
   - 控制台：系統狀態（連線 / IP / 相機 / 資料儲存模式）+ GPIO4 燈光滑動開關 switch（GET `/led?state=0|1`）
     - GPIO4 為 AI-Thinker 板載強光 LED；TFT 模式不衝突，SD 模式 1-bit 也不占用 GPIO4
@@ -157,5 +162,3 @@ AI-Thinker 板載 microSD 與 ST7789 共用腳位（SD_MMC 1-bit 需 GPIO14/15/2
 
 > 注意：`spiffs.bin` 是整包映像檔，上傳會覆蓋 SPIFFS 分割區全部內容，
 > 打包時 `data/` 內必須包含完整的三個網頁檔，缺檔會導致對應頁面載入失敗。
-
-新增連接上wifi ap時自動開啟瀏覽器功能
