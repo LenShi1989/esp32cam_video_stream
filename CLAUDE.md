@@ -85,9 +85,15 @@ Setup24_ST7789.h 設定
     - 網頁每秒輪詢 GET `/motion/status`（enabled/region/diff/triggered/lastId/count）更新綠框/紅框、DIFF %、
       並比對 lastId 偵測新告警 → 右下角 toast 通知 + 蜂鳴 + 側欄「告警紀錄」紅色計數徽章
     - 同樣有旋轉按鈕；框選/綠紅框顯示會依旋轉角度自動換算，與畫面一致
-    - Discord 推播通知：觸發告警時由獨立任務 (core 1) 將「時間 + 擷取影像」以 multipart POST 到 Discord Webhook，
-      手機安裝 Discord App 即收到推播；需 STA 連上可上網的 Wi-Fi
-      - Webhook URL 存 NVS（GET/POST `/notify/config`，空字串 = 停用）、POST `/notify/test` 送測試訊息
+    - Discord / Telegram 推播通知：觸發告警時由獨立任務 (core 1) 將「時間 + 擷取影像」以 multipart
+      推播到 Discord Webhook 和/或 Telegram Bot（兩者可同時啟用，各自獨立設定/測試），
+      手機安裝對應 App 並開啟通知即收到推播；需 STA 連上可上網的 Wi-Fi
+      - Discord：Webhook URL 存 NVS（GET/POST `/notify/config` 的 `webhook` 欄位，空字串 = 停用）、
+        POST `/notify/test` 送測試訊息
+      - Telegram：Bot Token + Chat ID 存 NVS（GET/POST `/notify/config` 的 `tgToken`/`tgChatId` 欄位，
+        皆為空字串 = 停用）、POST `/notify/telegram/test` 送測試訊息；有圖片用 Bot API `sendPhoto`，
+        測試訊息 (無圖片) 用 `sendMessage`
+      - `/notify/config` POST 只更新請求中出現的欄位，Discord 卡片與 Telegram 卡片各自送出不會互相覆蓋
       - 訊息時間使用瀏覽器 POST `/time` 同步的 epoch + 時區 (tz 分鐘)
     - ST7789 同步顯示：TFT 串流畫面每幀疊加偵測框（綠 = 監控、紅 = 觸發，與網頁一致），
       觸發時右上角顯示黃色小鈴鐺（用 TFT 基本圖形拼出，觸發保持 1.5 秒）
@@ -117,10 +123,12 @@ AI-Thinker 板載 microSD 與 ST7789 共用腳位（SD_MMC 1-bit 需 GPIO14/15/2
     - `wifi.ssid / wifi.password`：Wi-Fi 設定紀錄（取代 NVS）
     - `motion.enabled / x / y / w / h / sens`：偵測框座標紀錄（開機自動還原並開始偵測）
     - `notify.webhook`：Discord Webhook
+    - `notify.tgToken / tgChatId`：Telegram Bot Token 與 Chat ID
   - 告警紀錄存 `/alarms/<id>.jpg` + `/alarms/index.json`，保留最近 50 筆（環形覆蓋最舊），斷電保留
   - 所有 SD 檔案存取以 `sdMutex` 序列化，鎖順序固定 alarmMutex → sdMutex
 - **TFT 模式**：無 SD 卡（維持原本行為）
-  - Wi-Fi / Webhook 存 NVS（Preferences），偵測框僅存 RAM（重開機需重設），告警存 PSRAM 保留 10 筆（斷電清空）
+  - Wi-Fi / Discord Webhook / Telegram Bot Token+ChatId 存 NVS（Preferences），
+    偵測框僅存 RAM（重開機需重設），告警存 PSRAM 保留 10 筆（斷電清空）
   - OTA 更新：上傳 .bin 無線更新（POST `/update?target=firmware|spiffs`，使用 Update.h）
     - target=firmware：韌體 .bin（Arduino IDE「Sketch > Export Compiled Binary」）
     - target=spiffs：SPIFFS 映像檔（mkspiffs 打包 `data` 資料夾），可免拉線更新網頁

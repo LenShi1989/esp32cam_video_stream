@@ -187,15 +187,24 @@ int alarmCount = 0;                 // 目前保存筆數 (<= alarmCap)
 volatile uint32_t alarmLastId = 0;  // 最新一筆 id，網頁輪詢比對用
 SemaphoreHandle_t alarmMutex;
 
-// ---------- Discord 推播通知 ----------
-// 告警觸發時把「時間 + 擷取圖片」POST 到 Discord Webhook，手機裝 Discord App
-// 即可收到推播。需 STA 連上可上網的 Wi-Fi。傳送由獨立任務處理 (TLS 握手
-// 需數秒)，避免卡住相機任務或 WebServer。
+// ---------- Discord / Telegram 推播通知 ----------
+// 告警觸發時把「時間 + 擷取圖片」推播到 Discord Webhook 和/或 Telegram Bot，
+// 手機裝對應 App 並開啟通知即可收到推播。需 STA 連上可上網的 Wi-Fi。傳送由
+// 獨立任務處理 (TLS 握手需數秒)，避免卡住相機任務或 WebServer。
 #define NOTIFY_PREF_NAMESPACE "notify"
 Preferences notifyPrefs;
 String discordWebhook;            // 空字串 = 未設定/停用
-SemaphoreHandle_t notifyMutex;    // 保護 discordWebhook 跨任務存取
-QueueHandle_t notifyQueue;        // 待推播的告警 id (0 = 測試訊息)
+String telegramBotToken;          // 空字串 = 未設定/停用；格式 123456:ABC-...
+String telegramChatId;            // 收訊的 chat id (可為負數群組 id)
+SemaphoreHandle_t notifyMutex;    // 保護以上推播設定跨任務存取
+// 待推播的任務：alarmId (0 = 測試訊息) + 要推播到哪些管道
+struct NotifyJob
+{
+  uint32_t alarmId;
+  bool toDiscord;
+  bool toTelegram;
+};
+QueueHandle_t notifyQueue;
 volatile int tzOffsetMin = 0;     // 瀏覽器時區 (分鐘，UTC+8 = 480)，供訊息時間顯示
 
 static bool initCamera();
@@ -206,6 +215,7 @@ void drawMotionOverlayOnTft(int16_t xoff, int16_t yoff);
 void drawBellIcon(int16_t cx, int16_t cy);
 void notifyTask(void *param);
 void sendDiscordNotify(uint32_t alarmId);
+void sendTelegramNotify(uint32_t alarmId);
 String formatEpoch(time_t epoch);
 void loadAppSettings();
 void saveAppSettings();
@@ -223,6 +233,7 @@ String jsonEscape(const String &s);
 void handleNotifyConfigGet();
 void handleNotifyConfigSet();
 void handleNotifyTest();
+void handleNotifyTelegramTest();
 void handleRoot();
 void handleCaptivePortal();
 void handleScan();
@@ -265,7 +276,7 @@ void setup()
   alarmMutex = xSemaphoreCreateMutex();
   notifyMutex = xSemaphoreCreateMutex();
   sdMutex = xSemaphoreCreateMutex();
-  notifyQueue = xQueueCreate(5, sizeof(uint32_t));
+  notifyQueue = xQueueCreate(5, sizeof(NotifyJob));
 
   // 自動偵測儲存模式：能掛載 microSD (1-bit) 就用 SD，否則維持 TFT + NVS/RAM
   if (SD_MMC.begin("/sdcard", true)) // true = 1-bit 模式，只占用 GPIO14/15/2
@@ -303,16 +314,22 @@ void setup()
 
   tryAutoConnectSavedWifi();
 
-  // TFT 模式才從 NVS 讀 Webhook (SD 模式已由 appsetting.json 載入)
+  // TFT 模式才從 NVS 讀推播設定 (SD 模式已由 appsetting.json 載入)
   if (!sdMode)
   {
     notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, true);
     discordWebhook = notifyPrefs.getString("webhook", "");
+    telegramBotToken = notifyPrefs.getString("tgToken", "");
+    telegramChatId = notifyPrefs.getString("tgChatId", "");
     notifyPrefs.end();
   }
   if (discordWebhook.length() > 0)
   {
     Serial.println("Discord 推播已設定");
+  }
+  if (telegramBotToken.length() > 0 && telegramChatId.length() > 0)
+  {
+    Serial.println("Telegram 推播已設定");
   }
 
   server.on("/", HTTP_GET, handleRoot);
@@ -332,6 +349,7 @@ void setup()
   server.on("/notify/config", HTTP_GET, handleNotifyConfigGet);
   server.on("/notify/config", HTTP_POST, handleNotifyConfigSet);
   server.on("/notify/test", HTTP_POST, handleNotifyTest);
+  server.on("/notify/telegram/test", HTTP_POST, handleNotifyTelegramTest);
   server.on("/recordings", HTTP_GET, handleRecList);
   server.on("/rec/file", HTTP_GET, handleRecFile);
   server.on("/rec/delete", HTTP_POST, handleRecDelete);
@@ -699,10 +717,11 @@ void addAlarmRecord(camera_fb_t *fb)
   }
   xSemaphoreGive(alarmMutex);
 
-  // 交給通知任務推播 Discord (佇列滿了就放棄這則，不能卡住相機任務)
+  // 交給通知任務推播 Discord/Telegram (佇列滿了就放棄這則，不能卡住相機任務)
   if (notifyQueue)
   {
-    xQueueSend(notifyQueue, &id, 0);
+    NotifyJob job{id, true, true};
+    xQueueSend(notifyQueue, &job, 0);
   }
 
   Serial.printf("移動偵測告警 #%u，JPEG %u bytes\n", id, (unsigned)outLen);
@@ -744,16 +763,17 @@ void drawBellIcon(int16_t cx, int16_t cy)
   tft.fillCircle(cx, cy + 9, 2, c);        // 鈴舌
 }
 
-// ================= Discord 推播通知 (core 1 獨立任務) =================
+// ================= Discord / Telegram 推播通知 (core 1 獨立任務) =================
 
 void notifyTask(void *param)
 {
   for (;;)
   {
-    uint32_t id;
-    if (xQueueReceive(notifyQueue, &id, portMAX_DELAY) == pdTRUE)
+    NotifyJob job;
+    if (xQueueReceive(notifyQueue, &job, portMAX_DELAY) == pdTRUE)
     {
-      sendDiscordNotify(id);
+      if (job.toDiscord) sendDiscordNotify(job.alarmId);
+      if (job.toTelegram) sendTelegramNotify(job.alarmId);
     }
   }
 }
@@ -903,6 +923,140 @@ void sendDiscordNotify(uint32_t alarmId)
   free(body);
 }
 
+// 以 multipart/form-data 呼叫 Telegram Bot API 推播「時間 + 觸發擷取圖片」。
+// 有圖片用 sendPhoto，測試訊息 (alarmId = 0，無圖片) 用 sendMessage。
+void sendTelegramNotify(uint32_t alarmId)
+{
+  // OTA 期間讓出頻寬與記憶體，等更新結束再送
+  while (otaInProgress)
+  {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  String token = telegramBotToken;
+  String chatId = telegramChatId;
+  xSemaphoreGive(notifyMutex);
+  if (token.length() == 0 || chatId.length() == 0)
+  {
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Telegram 通知略過：STA 未連上可上網的 Wi-Fi");
+    return;
+  }
+
+  // 取出告警 JPEG 副本，避免傳送期間環形緩衝被覆蓋
+  // (TFT 模式從 PSRAM 複製；SD 模式從 SD 檔案讀入)
+  uint8_t *jpg = NULL;
+  size_t jpgSize = 0;
+  time_t epoch = time(NULL);
+  if (alarmId != 0)
+  {
+    xSemaphoreTake(alarmMutex, portMAX_DELAY);
+    for (int i = 0; i < alarmCount; i++)
+    {
+      if (alarmList[i].id != alarmId)
+      {
+        continue;
+      }
+      epoch = alarmList[i].epoch;
+      if (alarmList[i].jpg)
+      {
+        jpg = (uint8_t *)ps_malloc(alarmList[i].len);
+        if (jpg)
+        {
+          memcpy(jpg, alarmList[i].jpg, alarmList[i].len);
+          jpgSize = alarmList[i].len;
+        }
+      }
+      else if (sdMode)
+      {
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        File f = SD_MMC.open(alarmJpgPath(alarmId), FILE_READ);
+        if (f)
+        {
+          size_t fsize = f.size();
+          jpg = (uint8_t *)ps_malloc(fsize);
+          if (jpg && f.read(jpg, fsize) == fsize)
+          {
+            jpgSize = fsize;
+          }
+          else if (jpg)
+          {
+            free(jpg);
+            jpg = NULL;
+          }
+          f.close();
+        }
+        xSemaphoreGive(sdMutex);
+      }
+      break;
+    }
+    xSemaphoreGive(alarmMutex);
+  }
+
+  bool hasImage = (jpg != NULL);
+  String caption = (alarmId != 0)
+                       ? "⚠️ ESP32-CAM 移動偵測告警 #" + String(alarmId)
+                       : "🔔 ESP32-CAM 測試通知";
+  caption += "\n時間：" + formatEpoch(epoch);
+
+  const String boundary = "----Esp32CamTgBoundary";
+  String pre = "--" + boundary + "\r\n"
+               "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + chatId + "\r\n"
+               "--" + boundary + "\r\n"
+               "Content-Disposition: form-data; name=\"" + String(hasImage ? "caption" : "text") +
+               "\"\r\n\r\n" + caption;
+  String imgHead = "\r\n--" + boundary + "\r\n"
+                   "Content-Disposition: form-data; name=\"photo\"; filename=\"alarm_" +
+                   String(alarmId) + ".jpg\"\r\n"
+                   "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  size_t total = pre.length() + (hasImage ? imgHead.length() + jpgSize : 0) + tail.length();
+  uint8_t *body = (uint8_t *)ps_malloc(total);
+  if (!body)
+  {
+    if (jpg) free(jpg);
+    Serial.println("Telegram 通知失敗：PSRAM 配置失敗");
+    return;
+  }
+  size_t off = 0;
+  memcpy(body + off, pre.c_str(), pre.length());
+  off += pre.length();
+  if (hasImage)
+  {
+    memcpy(body + off, imgHead.c_str(), imgHead.length());
+    off += imgHead.length();
+    memcpy(body + off, jpg, jpgSize);
+    off += jpgSize;
+    free(jpg);
+  }
+  memcpy(body + off, tail.c_str(), tail.length());
+
+  String url = "https://api.telegram.org/bot" + token + "/" + (hasImage ? "sendPhoto" : "sendMessage");
+  WiFiClientSecure client;
+  client.setInsecure(); // 不驗證憑證：Bot Token 本身即含密鑰，省去維護根憑證
+  HTTPClient https;
+  https.setConnectTimeout(8000);
+  https.setTimeout(15000);
+  if (https.begin(client, url))
+  {
+    https.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    int code = https.POST(body, total);
+    Serial.printf("Telegram 通知 #%u -> HTTP %d %s\n", alarmId, code,
+                  (code >= 200 && code < 300) ? "OK" : "失敗");
+    https.end();
+  }
+  else
+  {
+    Serial.println("Telegram 通知失敗：無法連線 api.telegram.org");
+  }
+  free(body);
+}
+
 // ================= SD 卡儲存 (appsetting.json / 告警索引) =================
 
 String alarmJpgPath(uint32_t id)
@@ -971,6 +1125,10 @@ void loadAppSettings()
   {
     cJSON *it = cJSON_GetObjectItem(notify, "webhook");
     if (cJSON_IsString(it)) discordWebhook = it->valuestring;
+    it = cJSON_GetObjectItem(notify, "tgToken");
+    if (cJSON_IsString(it)) telegramBotToken = it->valuestring;
+    it = cJSON_GetObjectItem(notify, "tgChatId");
+    if (cJSON_IsString(it)) telegramChatId = it->valuestring;
   }
 
   cJSON_Delete(root);
@@ -990,6 +1148,8 @@ void saveAppSettings()
   xSemaphoreGive(motionCfgMutex);
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   String webhook = discordWebhook;
+  String tgToken = telegramBotToken;
+  String tgChatId = telegramChatId;
   xSemaphoreGive(notifyMutex);
 
   cJSON *root = cJSON_CreateObject();
@@ -1005,6 +1165,8 @@ void saveAppSettings()
   cJSON_AddNumberToObject(motion, "sens", cfg.sensitivity);
   cJSON *notify = cJSON_AddObjectToObject(root, "notify");
   cJSON_AddStringToObject(notify, "webhook", webhook.c_str());
+  cJSON_AddStringToObject(notify, "tgToken", tgToken.c_str());
+  cJSON_AddStringToObject(notify, "tgChatId", tgChatId.c_str());
 
   char *text = cJSON_Print(root); // 含縮排排版，可直接用電腦開卡檢視/編輯
   cJSON_Delete(root);
@@ -1726,30 +1888,54 @@ void handleTimeSync()
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// ---------- Discord 推播設定 ----------
+// ---------- Discord / Telegram 推播設定 ----------
 
 void handleNotifyConfigGet()
 {
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   String url = discordWebhook;
+  String tgToken = telegramBotToken;
+  String tgChatId = telegramChatId;
   xSemaphoreGive(notifyMutex);
-  server.send(200, "application/json", "{\"webhook\":\"" + jsonEscape(url) + "\"}");
+  server.send(200, "application/json",
+              "{\"webhook\":\"" + jsonEscape(url) +
+                  "\",\"tgToken\":\"" + jsonEscape(tgToken) +
+                  "\",\"tgChatId\":\"" + jsonEscape(tgChatId) + "\"}");
 }
 
-// POST webhook=... 儲存到 NVS；傳空字串 = 清除/停用推播
+// POST webhook=... 和/或 tgToken=...&tgChatId=...，只更新請求中出現的欄位，
+// 未出現的欄位維持原值 (Discord 卡片與 Telegram 卡片各自獨立送出)。傳空字串 = 清除/停用該管道。
 void handleNotifyConfigSet()
 {
+  bool hasWebhook = server.hasArg("webhook");
+  bool hasTgToken = server.hasArg("tgToken");
+  bool hasTgChatId = server.hasArg("tgChatId");
+
   String url = server.arg("webhook");
   url.trim();
-  if (url.length() > 0 && !url.startsWith("https://"))
+  if (hasWebhook && url.length() > 0 && !url.startsWith("https://"))
   {
     server.send(400, "application/json",
                 "{\"ok\":false,\"error\":\"Webhook 需為 https:// 開頭\"}");
     return;
   }
 
+  String tgToken = server.arg("tgToken");
+  tgToken.trim();
+  if (hasTgToken && tgToken.length() > 0 && tgToken.indexOf(':') <= 0)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"Bot Token 格式錯誤，應為數字:字母組合\"}");
+    return;
+  }
+
+  String tgChatId = server.arg("tgChatId");
+  tgChatId.trim();
+
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
-  discordWebhook = url;
+  if (hasWebhook) discordWebhook = url;
+  if (hasTgToken) telegramBotToken = tgToken;
+  if (hasTgChatId) telegramChatId = tgChatId;
   xSemaphoreGive(notifyMutex);
 
   if (sdMode)
@@ -1759,15 +1945,24 @@ void handleNotifyConfigSet()
   else
   {
     notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, false);
-    notifyPrefs.putString("webhook", url);
+    if (hasWebhook) notifyPrefs.putString("webhook", url);
+    if (hasTgToken) notifyPrefs.putString("tgToken", tgToken);
+    if (hasTgChatId) notifyPrefs.putString("tgChatId", tgChatId);
     notifyPrefs.end();
   }
 
-  Serial.println(url.length() > 0 ? "Discord Webhook 已更新" : "Discord Webhook 已清除");
+  if (hasWebhook)
+  {
+    Serial.println(url.length() > 0 ? "Discord Webhook 已更新" : "Discord Webhook 已清除");
+  }
+  if (hasTgToken || hasTgChatId)
+  {
+    Serial.println("Telegram 設定已更新");
+  }
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// 排入一則測試訊息 (不帶圖片)，實際結果看序列埠與 Discord 頻道
+// 排入一則測試訊息 (不帶圖片，只送 Discord)，實際結果看序列埠與 Discord 頻道
 void handleNotifyTest()
 {
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
@@ -1787,8 +1982,33 @@ void handleNotifyTest()
     return;
   }
 
-  uint32_t id = 0;
-  xQueueSend(notifyQueue, &id, 0);
+  NotifyJob job{0, true, false};
+  xQueueSend(notifyQueue, &job, 0);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// 排入一則測試訊息 (不帶圖片，只送 Telegram)，實際結果看序列埠與 Telegram 對話
+void handleNotifyTelegramTest()
+{
+  xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  bool hasTelegram = telegramBotToken.length() > 0 && telegramChatId.length() > 0;
+  xSemaphoreGive(notifyMutex);
+
+  if (!hasTelegram)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"尚未設定 Bot Token 與 Chat ID\"}");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"STA 未連線，請先連上可上網的 Wi-Fi\"}");
+    return;
+  }
+
+  NotifyJob job{0, false, true};
+  xQueueSend(notifyQueue, &job, 0);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 

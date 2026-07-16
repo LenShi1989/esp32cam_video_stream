@@ -405,6 +405,8 @@ async function loadNotifyConfig() {
     const res = await fetch("/notify/config");
     const d = await res.json();
     webhookInput.value = d.webhook || "";
+    tgTokenInput.value = d.tgToken || "";
+    tgChatIdInput.value = d.tgChatId || "";
   } catch (e) {
     /* 讀取失敗維持空白，可直接重新輸入 */
   }
@@ -432,6 +434,44 @@ webhookTestBtn.addEventListener("click", async () => {
     else setWebhookMsg("err", d.error || "測試失敗");
   } catch (e) {
     setWebhookMsg("err", "測試失敗");
+  }
+});
+
+// ---------- Telegram 推播通知設定 ----------
+const tgTokenInput = document.getElementById("tgTokenInput");
+const tgChatIdInput = document.getElementById("tgChatIdInput");
+const tgSaveBtn = document.getElementById("tgSaveBtn");
+const tgTestBtn = document.getElementById("tgTestBtn");
+const tgMsg = document.getElementById("tgMsg");
+
+function setTgMsg(cls, text) {
+  tgMsg.className = "msg " + cls;
+  tgMsg.textContent = text;
+}
+
+tgSaveBtn.addEventListener("click", async () => {
+  const token = tgTokenInput.value.trim();
+  const chatId = tgChatIdInput.value.trim();
+  try {
+    const body = new URLSearchParams({ tgToken: token, tgChatId: chatId });
+    const res = await fetch("/notify/config", { method: "POST", body });
+    const d = await res.json();
+    if (d.ok) setTgMsg("ok", token ? "已儲存" : "已清除，推播停用");
+    else setTgMsg("err", d.error || "儲存失敗");
+  } catch (e) {
+    setTgMsg("err", "儲存失敗");
+  }
+});
+
+tgTestBtn.addEventListener("click", async () => {
+  setTgMsg("", "傳送中...");
+  try {
+    const res = await fetch("/notify/telegram/test", { method: "POST" });
+    const d = await res.json();
+    if (d.ok) setTgMsg("ok", "已排入傳送，請到 Telegram 對話確認");
+    else setTgMsg("err", d.error || "測試失敗");
+  } catch (e) {
+    setTgMsg("err", "測試失敗");
   }
 });
 

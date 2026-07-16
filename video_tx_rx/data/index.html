@@ -212,6 +212,35 @@
             <span id="webhookMsg" class="msg"></span>
           </div>
         </div>
+        <div class="card" style="max-width: 520px">
+          <h2>Telegram 推播通知</h2>
+          <p class="muted" style="margin: 0">
+            觸發告警時將「時間 + 擷取影像」傳送到 Telegram 對話，手機安裝
+            Telegram App 即可收到推播。需先在「Wi-Fi
+            設定」連上可上網的網路。建立方式：跟 @BotFather 建立 Bot 取得 Token，
+            再向該 Bot 發一則訊息後用 Token 呼叫
+            getUpdates 取得你的 Chat ID。
+          </p>
+          <input
+            id="tgTokenInput"
+            type="text"
+            placeholder="Bot Token，例如 123456789:ABC-..."
+          />
+          <input
+            id="tgChatIdInput"
+            type="text"
+            placeholder="Chat ID，例如 123456789"
+          />
+          <div class="row" style="margin-top: 14px">
+            <div style="display: flex; gap: 10px">
+              <button id="tgSaveBtn" type="button">儲存</button>
+              <button id="tgTestBtn" class="ghost" type="button">
+                測試傳送
+              </button>
+            </div>
+            <span id="tgMsg" class="msg"></span>
+          </div>
+        </div>
       </section>
 
       <!-- ========== 告警紀錄 ========== -->
