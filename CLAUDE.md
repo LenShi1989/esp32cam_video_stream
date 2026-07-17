@@ -41,6 +41,29 @@
 > 注意：ESP32-CAM 只有一組 SPI 排線可用的腳位較少，此模組沒有獨立 CS 腳位，
 > 因此不需另外接 CS。若接線後畫面異常，可嘗試將 BLK 直接接 3.3V 確認是否為背光腳位問題。
 
+## 程式使用的函式庫 (Library)
+
+`video_tx_rx/video_tx_rx.ino` 開頭 `#include` 的函式庫：
+
+- 需另外用 Arduino Library Manager 安裝：
+  - `TFT_eSPI`（Bodmer）— ST7789 顯示驅動，設定方式見下節「TFT_eSPI 設定」
+- arduino-esp32 核心內建（安裝 ESP32 開發板套件即含，不需另外安裝）：
+  - `esp_camera.h` / `img_converters.h`（frame2jpg）— ESP32 相機驅動與 JPEG 轉換
+  - `soc/soc.h` / `soc/rtc_cntl_reg.h` — 關閉 brownout 偵測用
+  - `WiFi.h` — AP + STA 連線
+  - `WiFiClientSecure.h` / `HTTPClient.h` — Discord Webhook / Telegram Bot API 推播（HTTPS）
+  - `WebServer.h` / `DNSServer.h` — 網頁伺服器 + captive portal DNS 導向
+  - `SPI.h` / `FS.h` / `SPIFFS.h` — SPI 匯流排、檔案系統介面、網頁檔存放（TFT 模式）
+  - `SD_MMC.h` — 板載 microSD 1-bit 模式（SD 模式儲存 appsetting.json / 告警 / 錄影）
+  - `cJSON.h`（ESP-IDF json 元件）— 解析/產生 `/appsetting.json`
+  - `Preferences.h` — NVS 設定儲存（TFT 模式：Wi-Fi / Discord Webhook / Telegram Token+ChatId）
+  - `Update.h` — OTA 韌體 / SPIFFS 更新
+  - `time.h` / `sys/time.h` — 告警與推播訊息時間戳（`settimeofday` 由網頁同步）
+
+> `FS.h` 必須在 `TFT_eSPI.h` 之前引入，避免 `TFT_eSPI` 以 `FS_NO_GLOBALS` 方式重複引入
+> 導致 `fs::FS`/`fs::File` 未別名到全域 `FS`/`File`，造成 `WebServer.h` 與 `SPIFFS` 存取編譯失敗
+> （詳見程式內註解）。
+
 ## TFT_eSPI 設定
 
 文件\Arduino\libraries\TFT_eSPI
