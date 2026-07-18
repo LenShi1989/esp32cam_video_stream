@@ -31,6 +31,9 @@
       <div class="nav-item" data-view="ota">
         <span class="ico">⇪</span>OTA 更新
       </div>
+      <div class="nav-item" data-view="user">
+        <span class="ico">⚿</span>使用者設定
+      </div>
       <div class="sidebar-foot">
         <span id="footDot" class="dot"></span
         ><span id="footText">SYSTEM ...</span>
@@ -330,6 +333,49 @@
           <div class="kv">
             <span class="k">完成後</span
             ><span class="v">裝置自動重啟，頁面自動重新整理</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========== 使用者設定 ========== -->
+      <section id="panel-user" class="panel">
+        <div class="card" style="max-width: 520px">
+          <h2>登入保護</h2>
+          <p class="muted" style="margin: 0">
+            啟用後，連上此裝置網頁需輸入帳號密碼才能存取（HTTP Basic
+            Auth，瀏覽器原生登入視窗，儲存後請重新整理頁面登入）。使用者名稱留空並儲存可停用登入保護。忘記密碼需清除裝置儲存設定（NVS
+            或 SD 卡 appsetting.json）才能重設，請自行妥善保管。
+          </p>
+          <div class="kv">
+            <span class="k">目前狀態</span
+            ><span class="v" id="authStatus">讀取中...</span>
+          </div>
+          <input
+            id="authUserInput"
+            type="text"
+            placeholder="新使用者名稱"
+            autocomplete="off"
+          />
+          <input
+            id="authPassInput"
+            type="password"
+            placeholder="新密碼 (至少 4 個字元)"
+            autocomplete="new-password"
+          />
+          <input
+            id="authPassInput2"
+            type="password"
+            placeholder="確認新密碼"
+            autocomplete="new-password"
+          />
+          <div class="row" style="margin-top: 14px">
+            <div style="display: flex; gap: 10px">
+              <button id="authSaveBtn" type="button">儲存並啟用</button>
+              <button id="authDisableBtn" class="danger" type="button">
+                停用登入保護
+              </button>
+            </div>
+            <span id="authMsg" class="msg"></span>
           </div>
         </div>
       </section>

@@ -207,6 +207,17 @@ struct NotifyJob
 QueueHandle_t notifyQueue;
 volatile int tzOffsetMin = 0;     // 瀏覽器時區 (分鐘，UTC+8 = 480)，供訊息時間顯示
 
+// ---------- 使用者登入保護 (HTTP Basic Auth) ----------
+// authUser 空字串 = 停用登入保護 (預設)，一旦設定，網頁 API 皆需登入才能存取
+// (靜態檔案 style.css/app.js 除外)。憑證存放位置比照 Discord/Telegram 設定：
+// TFT 模式存 NVS，SD 模式存 appsetting.json。忘記密碼需清除該儲存位置才能重設。
+#define AUTH_PREF_NAMESPACE "auth"
+Preferences authPrefs;
+String authUser; // 空字串 = 未設定/停用
+String authPass;
+SemaphoreHandle_t authMutex;
+bool otaAuthOk = true; // OTA 上傳開始時檢查一次，未授權則整段上傳略過寫入
+
 static bool initCamera();
 void cameraTask(void *param);
 void detectMotionOnFrame(camera_fb_t *fb);
@@ -234,6 +245,10 @@ void handleNotifyConfigGet();
 void handleNotifyConfigSet();
 void handleNotifyTest();
 void handleNotifyTelegramTest();
+bool isAuthed();
+bool checkAuth();
+void handleAuthConfigGet();
+void handleAuthConfigSet();
 void handleRoot();
 void handleCaptivePortal();
 void handleScan();
@@ -276,6 +291,7 @@ void setup()
   alarmMutex = xSemaphoreCreateMutex();
   notifyMutex = xSemaphoreCreateMutex();
   sdMutex = xSemaphoreCreateMutex();
+  authMutex = xSemaphoreCreateMutex();
   notifyQueue = xQueueCreate(5, sizeof(NotifyJob));
 
   // 自動偵測儲存模式：能掛載 microSD (1-bit) 就用 SD，否則維持 TFT + NVS/RAM
@@ -322,6 +338,15 @@ void setup()
     telegramBotToken = notifyPrefs.getString("tgToken", "");
     telegramChatId = notifyPrefs.getString("tgChatId", "");
     notifyPrefs.end();
+
+    authPrefs.begin(AUTH_PREF_NAMESPACE, true);
+    authUser = authPrefs.getString("user", "");
+    authPass = authPrefs.getString("pass", "");
+    authPrefs.end();
+  }
+  if (authUser.length() > 0)
+  {
+    Serial.println("登入保護已啟用");
   }
   if (discordWebhook.length() > 0)
   {
@@ -350,6 +375,8 @@ void setup()
   server.on("/notify/config", HTTP_POST, handleNotifyConfigSet);
   server.on("/notify/test", HTTP_POST, handleNotifyTest);
   server.on("/notify/telegram/test", HTTP_POST, handleNotifyTelegramTest);
+  server.on("/auth/config", HTTP_GET, handleAuthConfigGet);
+  server.on("/auth/config", HTTP_POST, handleAuthConfigSet);
   server.on("/recordings", HTTP_GET, handleRecList);
   server.on("/rec/file", HTTP_GET, handleRecFile);
   server.on("/rec/delete", HTTP_POST, handleRecDelete);
@@ -1133,6 +1160,15 @@ void loadAppSettings()
     if (cJSON_IsString(it)) telegramChatId = it->valuestring;
   }
 
+  cJSON *auth = cJSON_GetObjectItem(root, "auth");
+  if (auth)
+  {
+    cJSON *it = cJSON_GetObjectItem(auth, "user");
+    if (cJSON_IsString(it)) authUser = it->valuestring;
+    it = cJSON_GetObjectItem(auth, "pass");
+    if (cJSON_IsString(it)) authPass = it->valuestring;
+  }
+
   cJSON_Delete(root);
   Serial.println("已載入 appsetting.json");
 }
@@ -1153,6 +1189,10 @@ void saveAppSettings()
   String tgToken = telegramBotToken;
   String tgChatId = telegramChatId;
   xSemaphoreGive(notifyMutex);
+  xSemaphoreTake(authMutex, portMAX_DELAY);
+  String authU = authUser;
+  String authP = authPass;
+  xSemaphoreGive(authMutex);
 
   cJSON *root = cJSON_CreateObject();
   cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
@@ -1169,6 +1209,9 @@ void saveAppSettings()
   cJSON_AddStringToObject(notify, "webhook", webhook.c_str());
   cJSON_AddStringToObject(notify, "tgToken", tgToken.c_str());
   cJSON_AddStringToObject(notify, "tgChatId", tgChatId.c_str());
+  cJSON *auth = cJSON_AddObjectToObject(root, "auth");
+  cJSON_AddStringToObject(auth, "user", authU.c_str());
+  cJSON_AddStringToObject(auth, "pass", authP.c_str());
 
   char *text = cJSON_Print(root); // 含縮排排版，可直接用電腦開卡檢視/編輯
   cJSON_Delete(root);
@@ -1477,8 +1520,86 @@ String jsonEscape(const String &s)
   return out;
 }
 
+// ---------- 使用者登入保護 (HTTP Basic Auth) ----------
+
+// 純檢查 Authorization 標頭，不送出任何回應 (供上傳中途安全呼叫)
+bool isAuthed()
+{
+  xSemaphoreTake(authMutex, portMAX_DELAY);
+  String u = authUser;
+  String p = authPass;
+  xSemaphoreGive(authMutex);
+  if (u.length() == 0)
+  {
+    return true; // 未設定帳號密碼 = 不需登入
+  }
+  return server.authenticate(u.c_str(), p.c_str());
+}
+
+// 未通過驗證時送出 401 + Basic Auth 挑戰，觸發瀏覽器原生登入視窗
+bool checkAuth()
+{
+  if (isAuthed())
+  {
+    return true;
+  }
+  server.requestAuthentication();
+  return false;
+}
+
+void handleAuthConfigGet()
+{
+  if (!checkAuth()) return;
+  xSemaphoreTake(authMutex, portMAX_DELAY);
+  bool enabled = authUser.length() > 0;
+  String u = authUser;
+  xSemaphoreGive(authMutex);
+  server.send(200, "application/json",
+              "{\"enabled\":" + String(enabled ? "true" : "false") +
+                  ",\"user\":\"" + jsonEscape(u) + "\"}");
+}
+
+// POST user=...&pass=...：user 空字串 = 停用登入保護；否則兩者皆須非空，
+// 密碼至少 4 個字元
+void handleAuthConfigSet()
+{
+  if (!checkAuth()) return;
+
+  String u = server.arg("user");
+  u.trim();
+  String p = server.arg("pass");
+
+  if (u.length() > 0 && p.length() < 4)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"密碼至少需 4 個字元\"}");
+    return;
+  }
+
+  xSemaphoreTake(authMutex, portMAX_DELAY);
+  authUser = u;
+  authPass = (u.length() > 0) ? p : "";
+  xSemaphoreGive(authMutex);
+
+  if (sdMode)
+  {
+    saveAppSettings();
+  }
+  else
+  {
+    authPrefs.begin(AUTH_PREF_NAMESPACE, false);
+    authPrefs.putString("user", authUser);
+    authPrefs.putString("pass", authPass);
+    authPrefs.end();
+  }
+
+  Serial.println(u.length() > 0 ? "登入保護已啟用" : "登入保護已停用");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleRoot()
 {
+  if (!checkAuth()) return;
   File f = SPIFFS.open("/index.html", "r");
   if (!f)
   {
@@ -1508,6 +1629,7 @@ void handleCaptivePortal()
 
 void handleScan()
 {
+  if (!checkAuth()) return;
   int n = WiFi.scanNetworks();
   String json = "[";
   for (int i = 0; i < n; i++)
@@ -1526,6 +1648,7 @@ void handleScan()
 
 void handleConnect()
 {
+  if (!checkAuth()) return;
   if (!server.hasArg("ssid") || server.arg("ssid").length() == 0)
   {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing ssid\"}");
@@ -1558,6 +1681,7 @@ void handleConnect()
 
 void handleStatus()
 {
+  if (!checkAuth()) return;
   bool connected = WiFi.status() == WL_CONNECTED;
   String json = "{";
   json += "\"connected\":" + String(connected ? "true" : "false");
@@ -1573,6 +1697,7 @@ void handleStatus()
 
 void handleCapture()
 {
+  if (!checkAuth()) return;
   if (!cameraOk)
   {
     server.send(503, "application/json", "{\"error\":\"camera not ready\"}");
@@ -1599,6 +1724,7 @@ void handleCapture()
 
 void handleClearWifi()
 {
+  if (!checkAuth()) return;
   if (sdMode)
   {
     sdWifiSsid = "";
@@ -1624,6 +1750,7 @@ void handleClearWifi()
 // 設定偵測區域/靈敏度 (POST enabled=0|1&x&y&w&h&sens，座標為感光元件方向 240x240)
 void handleMotionConfig()
 {
+  if (!checkAuth()) return;
   bool enabled = server.arg("enabled") == "1";
   int x = server.arg("x").toInt();
   int y = server.arg("y").toInt();
@@ -1653,6 +1780,7 @@ void handleMotionConfig()
 
 void handleMotionStatus()
 {
+  if (!checkAuth()) return;
   xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
   MotionConfig cfg = motionCfg;
   xSemaphoreGive(motionCfgMutex);
@@ -1675,6 +1803,7 @@ void handleMotionStatus()
 // 告警清單 (新到舊)：[{"id":N,"time":epoch}, ...]
 void handleAlarmList()
 {
+  if (!checkAuth()) return;
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
   String json = "[";
   for (int i = 0; i < alarmCount; i++)
@@ -1691,6 +1820,7 @@ void handleAlarmList()
 
 void handleAlarmImage()
 {
+  if (!checkAuth()) return;
   uint32_t id = (uint32_t)server.arg("id").toInt();
 
   if (sdMode)
@@ -1729,6 +1859,7 @@ void handleAlarmImage()
 
 void handleAlarmClear()
 {
+  if (!checkAuth()) return;
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
   for (int i = 0; i < alarmCap; i++)
   {
@@ -1759,6 +1890,7 @@ void handleAlarmClear()
 // 錄影檔清單 (檔名含日期時間，由網頁端解析排序)
 void handleRecList()
 {
+  if (!checkAuth()) return;
   if (!sdMode)
   {
     server.send(200, "application/json", "[]");
@@ -1800,6 +1932,7 @@ static bool validRecName(const String &name)
 // 卡死 core 0 的錄影寫入
 void handleRecFile()
 {
+  if (!checkAuth()) return;
   String name = server.arg("name");
   if (!sdMode || !validRecName(name))
   {
@@ -1854,6 +1987,7 @@ void handleRecFile()
 
 void handleRecDelete()
 {
+  if (!checkAuth()) return;
   String name = server.arg("name");
   if (!sdMode || !validRecName(name))
   {
@@ -1877,6 +2011,7 @@ void handleRecDelete()
 // 網頁載入時 POST epoch=秒&tz=時區分鐘 同步時間 (AP 模式沒網路拿不到 NTP)
 void handleTimeSync()
 {
+  if (!checkAuth()) return;
   long long epoch = atoll(server.arg("epoch").c_str());
   if (epoch > 1000000000LL)
   {
@@ -1894,6 +2029,7 @@ void handleTimeSync()
 
 void handleNotifyConfigGet()
 {
+  if (!checkAuth()) return;
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   String url = discordWebhook;
   String tgToken = telegramBotToken;
@@ -1909,6 +2045,7 @@ void handleNotifyConfigGet()
 // 未出現的欄位維持原值 (Discord 卡片與 Telegram 卡片各自獨立送出)。傳空字串 = 清除/停用該管道。
 void handleNotifyConfigSet()
 {
+  if (!checkAuth()) return;
   bool hasWebhook = server.hasArg("webhook");
   bool hasTgToken = server.hasArg("tgToken");
   bool hasTgChatId = server.hasArg("tgChatId");
@@ -1967,6 +2104,7 @@ void handleNotifyConfigSet()
 // 排入一則測試訊息 (不帶圖片，只送 Discord)，實際結果看序列埠與 Discord 頻道
 void handleNotifyTest()
 {
+  if (!checkAuth()) return;
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   bool hasWebhook = discordWebhook.length() > 0;
   xSemaphoreGive(notifyMutex);
@@ -1992,6 +2130,7 @@ void handleNotifyTest()
 // 排入一則測試訊息 (不帶圖片，只送 Telegram)，實際結果看序列埠與 Telegram 對話
 void handleNotifyTelegramTest()
 {
+  if (!checkAuth()) return;
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   bool hasTelegram = telegramBotToken.length() > 0 && telegramChatId.length() > 0;
   xSemaphoreGive(notifyMutex);
@@ -2017,6 +2156,7 @@ void handleNotifyTelegramTest()
 // 上傳結束後回覆結果；成功則重新啟動套用新韌體/新網頁資料
 void handleUpdateFinished()
 {
+  if (!checkAuth()) return;
   server.sendHeader("Connection", "close");
   if (otaSuccess)
   {
@@ -2041,6 +2181,15 @@ void handleUpdateUpload()
 
   if (upload.status == UPLOAD_FILE_START)
   {
+    // 未通過驗證：不呼叫 Update.begin，略過整段上傳寫入。此時回應尚未送出，
+    // 不能在這裡呼叫 requestAuthentication (會打斷仍在傳送中的上傳)，
+    // 留待上傳結束後 handleUpdateFinished 的 checkAuth() 一併回覆 401
+    otaAuthOk = isAuthed();
+    if (!otaAuthOk)
+    {
+      return;
+    }
+
     otaInProgress = true;
     otaSuccess = false;
 
@@ -2058,6 +2207,7 @@ void handleUpdateUpload()
   }
   else if (upload.status == UPLOAD_FILE_WRITE)
   {
+    if (!otaAuthOk) return;
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
     {
       Update.printError(Serial);
@@ -2065,6 +2215,7 @@ void handleUpdateUpload()
   }
   else if (upload.status == UPLOAD_FILE_END)
   {
+    if (!otaAuthOk) return;
     if (Update.end(true))
     {
       otaSuccess = true;
@@ -2077,6 +2228,7 @@ void handleUpdateUpload()
   }
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
+    if (!otaAuthOk) return;
     Update.abort();
     otaInProgress = false;
     Serial.println("OTA 已中斷");
@@ -2085,6 +2237,7 @@ void handleUpdateUpload()
 
 void handleLed()
 {
+  if (!checkAuth()) return;
   if (server.hasArg("state"))
   {
     String s = server.arg("state");

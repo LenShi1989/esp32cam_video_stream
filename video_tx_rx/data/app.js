@@ -7,6 +7,7 @@ const VIEW_TITLES = {
   alarm: "告警紀錄",
   playback: "錄影回放",
   ota: "OTA 更新",
+  user: "使用者設定",
 };
 let currentView = "console";
 
@@ -25,6 +26,7 @@ document.querySelectorAll(".nav-item").forEach((item) => {
     if (currentView === "alarm") loadAlarms();
     if (currentView === "playback") loadRecordings();
     else stopPlayback(); // 離開回放頁即停止串流下載
+    if (currentView === "user") loadAuthConfig();
   });
 });
 
@@ -472,6 +474,90 @@ tgTestBtn.addEventListener("click", async () => {
     else setTgMsg("err", d.error || "測試失敗");
   } catch (e) {
     setTgMsg("err", "測試失敗");
+  }
+});
+
+// ---------- 使用者登入保護 (HTTP Basic Auth) ----------
+const authStatus = document.getElementById("authStatus");
+const authUserInput = document.getElementById("authUserInput");
+const authPassInput = document.getElementById("authPassInput");
+const authPassInput2 = document.getElementById("authPassInput2");
+const authSaveBtn = document.getElementById("authSaveBtn");
+const authDisableBtn = document.getElementById("authDisableBtn");
+const authMsg = document.getElementById("authMsg");
+
+function setAuthMsg(cls, text) {
+  authMsg.className = "msg " + cls;
+  authMsg.textContent = text;
+}
+
+async function loadAuthConfig() {
+  try {
+    const res = await fetch("/auth/config");
+    const d = await res.json();
+    authStatus.textContent = d.enabled
+      ? "已啟用（使用者：" + d.user + "）"
+      : "未啟用";
+    authStatus.style.color = d.enabled ? "var(--ok)" : "";
+  } catch (e) {
+    authStatus.textContent = "讀取失敗";
+  }
+}
+
+authSaveBtn.addEventListener("click", async () => {
+  const user = authUserInput.value.trim();
+  const pass = authPassInput.value;
+  const pass2 = authPassInput2.value;
+  if (!user) {
+    setAuthMsg("err", "請輸入使用者名稱");
+    return;
+  }
+  if (pass.length < 4) {
+    setAuthMsg("err", "密碼至少需 4 個字元");
+    return;
+  }
+  if (pass !== pass2) {
+    setAuthMsg("err", "兩次輸入的密碼不一致");
+    return;
+  }
+  try {
+    const body = new URLSearchParams({ user, pass });
+    const res = await fetch("/auth/config", { method: "POST", body });
+    const d = await res.json();
+    if (d.ok) {
+      setAuthMsg(
+        "ok",
+        "已啟用登入保護，請重新整理頁面並輸入剛設定的帳號密碼登入",
+      );
+      authPassInput.value = "";
+      authPassInput2.value = "";
+      loadAuthConfig();
+    } else {
+      setAuthMsg("err", d.error || "儲存失敗");
+    }
+  } catch (e) {
+    setAuthMsg("err", "儲存失敗");
+  }
+});
+
+authDisableBtn.addEventListener("click", async () => {
+  if (!confirm("確定要停用登入保護？之後任何人連上網頁都不需要帳號密碼。"))
+    return;
+  try {
+    const body = new URLSearchParams({ user: "", pass: "" });
+    const res = await fetch("/auth/config", { method: "POST", body });
+    const d = await res.json();
+    if (d.ok) {
+      setAuthMsg("ok", "已停用登入保護");
+      authUserInput.value = "";
+      authPassInput.value = "";
+      authPassInput2.value = "";
+      loadAuthConfig();
+    } else {
+      setAuthMsg("err", d.error || "停用失敗");
+    }
+  } catch (e) {
+    setAuthMsg("err", "停用失敗");
   }
 });
 
@@ -972,5 +1058,6 @@ refreshStatus();
 setInterval(refreshStatus, 2000);
 doScan();
 loadNotifyConfig();
+loadAuthConfig();
 pollMotion();
 frameLoop();

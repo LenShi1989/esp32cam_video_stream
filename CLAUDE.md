@@ -52,11 +52,12 @@
   - `soc/soc.h` / `soc/rtc_cntl_reg.h` — 關閉 brownout 偵測用
   - `WiFi.h` — AP + STA 連線
   - `WiFiClientSecure.h` / `HTTPClient.h` — Discord Webhook / Telegram Bot API 推播（HTTPS）
-  - `WebServer.h` / `DNSServer.h` — 網頁伺服器 + captive portal DNS 導向
+  - `WebServer.h` / `DNSServer.h` — 網頁伺服器 + captive portal DNS 導向；
+    也用其 `authenticate()` / `requestAuthentication()` 實作登入保護（HTTP Basic Auth）
   - `SPI.h` / `FS.h` / `SPIFFS.h` — SPI 匯流排、檔案系統介面、網頁檔存放（TFT 模式）
   - `SD_MMC.h` — 板載 microSD 1-bit 模式（SD 模式儲存 appsetting.json / 告警 / 錄影）
   - `cJSON.h`（ESP-IDF json 元件）— 解析/產生 `/appsetting.json`
-  - `Preferences.h` — NVS 設定儲存（TFT 模式：Wi-Fi / Discord Webhook / Telegram Token+ChatId）
+  - `Preferences.h` — NVS 設定儲存（TFT 模式：Wi-Fi / Discord Webhook / Telegram Token+ChatId / 登入帳號密碼）
   - `Update.h` — OTA 韌體 / SPIFFS 更新
   - `time.h` / `sys/time.h` — 告警與推播訊息時間戳（`settimeofday` 由網頁同步）
 
@@ -92,7 +93,7 @@ Setup24_ST7789.h 設定
     `connectivitycheck.gstatic.com`、`captive.apple.com`、`msftconnecttest.com` 偵測請求），
     一律回 302 導回 `/`；作業系統偵測到非預期回應即視為 captive portal，
     連上 `esp32_init` 熱點後會自動彈出瀏覽器導向設定頁，不必手動輸入 `192.168.4.1`
-- 網頁為科技風深色介面，側邊欄分四個頁面：
+- 網頁為科技風深色介面，側邊欄分八個頁面：
   - 控制台：系統狀態（連線 / IP / 相機 / 資料儲存模式）+ GPIO4 燈光滑動開關 switch（GET `/led?state=0|1`）
     - GPIO4 為 AI-Thinker 板載強光 LED；TFT 模式不衝突，SD 模式 1-bit 也不占用 GPIO4
   - Wi-Fi 設定：
@@ -136,6 +137,14 @@ Setup24_ST7789.h 設定
     - 兩筆告警最小間隔 5 秒，避免連續移動灌爆紀錄
     - GET `/alarms` 回傳清單（新到舊）、GET `/alarm/img?id=N` 回傳 JPEG、POST `/alarm/clear` 清除全部
     - 觸發時間由網頁載入時 POST `/time`（瀏覽器 epoch）同步到裝置（AP 模式無 NTP）；未同步前的紀錄顯示「時間未同步」
+  - 使用者設定：登入保護（HTTP Basic Auth），空使用者名稱 = 停用（預設，向下相容既有行為）
+    - GET `/auth/config` 回傳 `{enabled,user}`（不含密碼）、POST `/auth/config`（`user`/`pass` 欄位）設定或停用
+      （`user` 傳空字串 = 停用；啟用時密碼至少 4 個字元）
+    - 啟用後除 `server.onNotFound`（captive portal 偵測，需保持公開才能觸發手機/電腦自動彈出瀏覽器）與
+      靜態檔 `style.css`/`app.js` 外，所有 API 皆需登入（`checkAuth()` 驗證失敗回 401 並要求瀏覽器原生登入視窗）；
+      瀏覽器登入一次後會自動快取憑證並附加到同源的後續請求，不需每頁重新輸入
+    - OTA 上傳（`/update`）未通過驗證時整段上傳略過寫入（不呼叫 `Update.begin`），避免未授權寫入 flash
+    - 忘記密碼需清除儲存位置（NVS 或 SD 卡 appsetting.json 的 `auth` 欄位）才能重設，無其他救援機制
 
 ## 資料儲存模式（開機自動偵測 SD 卡）
 
@@ -149,10 +158,11 @@ AI-Thinker 板載 microSD 與 ST7789 共用腳位（SD_MMC 1-bit 需 GPIO14/15/2
     - `motion.enabled / x / y / w / h / sens`：偵測框座標紀錄（開機自動還原並開始偵測）
     - `notify.webhook`：Discord Webhook
     - `notify.tgToken / tgChatId`：Telegram Bot Token 與 Chat ID
+    - `auth.user / auth.pass`：登入保護帳號密碼（`auth.user` 空字串 = 停用）
   - 告警紀錄存 `/alarms/<id>.jpg` + `/alarms/index.json`，保留最近 50 筆（環形覆蓋最舊），斷電保留
   - 所有 SD 檔案存取以 `sdMutex` 序列化，鎖順序固定 alarmMutex → sdMutex
 - **TFT 模式**：無 SD 卡（維持原本行為）
-  - Wi-Fi / Discord Webhook / Telegram Bot Token+ChatId 存 NVS（Preferences），
+  - Wi-Fi / Discord Webhook / Telegram Bot Token+ChatId / 登入帳號密碼存 NVS（Preferences），
     偵測框僅存 RAM（重開機需重設），告警存 PSRAM 保留 10 筆（斷電清空）
   - OTA 更新：上傳 .bin 無線更新（POST `/update?target=firmware|spiffs`，使用 Update.h）
     - target=firmware：韌體 .bin（Arduino IDE「Sketch > Export Compiled Binary」）
