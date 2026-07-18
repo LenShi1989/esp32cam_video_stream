@@ -1,6 +1,8 @@
 /*
   esp32cam_video_stream
 
+  Arduino 3.3.10 version
+
   雙核心分工 (依 CLAUDE.md)：
     - 原始核心 (core 1，即 Arduino setup()/loop())：
       Web Server：開 AP (SSID esp32_init) -> 掃描/設定 Wi-Fi -> 連線成功後
@@ -48,7 +50,7 @@
 #include <Preferences.h>
 #include <Update.h> // OTA：網頁上傳 .bin 更新韌體 / SPIFFS
 #include <time.h>
-#include <sys/time.h> // settimeofday：由網頁同步時間，供告警紀錄時間戳使用
+#include <sys/time.h>       // settimeofday：由網頁同步時間，供告警紀錄時間戳使用
 #include "img_converters.h" // frame2jpg：RGB565 -> JPEG，供網頁快照串流使用
 
 // ---------- TFT 顯示尺寸 ----------
@@ -74,7 +76,7 @@
 #define CAM_PIN_PCLK 22
 
 // ---------- Web Server / Wi-Fi / LED 設定 ----------
-#define LED_PIN 4  // AI-Thinker 板載強光 LED，與相機腳位不衝突
+#define LED_PIN 4 // AI-Thinker 板載強光 LED，與相機腳位不衝突
 #define AP_SSID "esp32_init"
 #define WIFI_PREF_NAMESPACE "wifi"
 static const unsigned long STA_CONNECT_TIMEOUT_MS = 15000;
@@ -111,9 +113,9 @@ bool otaSuccess = false;
 // 變動像素比例超過門檻 (16 - 靈敏度)% 即觸發。區域座標為感光元件
 // 原始方向的 240x240 座標，網頁端負責把旋轉後的框選換算回來。
 #define MOTION_GRID 32
-#define MOTION_PIXEL_DIFF 28    // 單點灰階差異門檻 (灰階值 0~250)
+#define MOTION_PIXEL_DIFF 28        // 單點灰階差異門檻 (灰階值 0~250)
 #define MOTION_TRIGGER_HOLD_MS 1500 // 觸發後紅框/告警狀態保持時間
-#define MOTION_COOLDOWN_MS 5000 // 兩筆告警紀錄的最小間隔，避免連續移動灌爆紀錄
+#define MOTION_COOLDOWN_MS 5000     // 兩筆告警紀錄的最小間隔，避免連續移動灌爆紀錄
 
 struct MotionConfig
 {
@@ -161,10 +163,10 @@ volatile bool recordRequested = false; // 偵測觸發 -> 相機迴圈開始錄�
 File recFile;
 String recPath;
 uint32_t recFrames = 0;
-uint32_t recMoviBytes = 0;  // AVI movi 區塊大小 (含 'movi' fourcc)
+uint32_t recMoviBytes = 0; // AVI movi 區塊大小 (含 'movi' fourcc)
 uint32_t recStartMs = 0;
 uint32_t recNextFrameMs = 0;
-uint32_t *recIdx = NULL;    // idx1 索引 [offset,size] * RECORD_MAX_FRAMES (PSRAM)
+uint32_t *recIdx = NULL; // idx1 索引 [offset,size] * RECORD_MAX_FRAMES (PSRAM)
 
 // ---------- 告警紀錄 (觸發時間 + 觸發當下 JPEG) ----------
 // TFT 模式：JPEG 存 PSRAM 環形緩衝 (斷電消失，保留 10 筆)。
@@ -181,10 +183,10 @@ struct AlarmRec
   size_t len;
 };
 AlarmRec alarmList[MAX_ALARMS_SD] = {};
-int alarmCap = MAX_ALARMS_RAM;      // 依儲存模式在 setup() 調整
-int alarmWrite = 0;                 // 下一筆寫入位置
-int alarmCount = 0;                 // 目前保存筆數 (<= alarmCap)
-volatile uint32_t alarmLastId = 0;  // 最新一筆 id，網頁輪詢比對用
+int alarmCap = MAX_ALARMS_RAM;     // 依儲存模式在 setup() 調整
+int alarmWrite = 0;                // 下一筆寫入位置
+int alarmCount = 0;                // 目前保存筆數 (<= alarmCap)
+volatile uint32_t alarmLastId = 0; // 最新一筆 id，網頁輪詢比對用
 SemaphoreHandle_t alarmMutex;
 
 // ---------- Discord / Telegram 推播通知 ----------
@@ -193,10 +195,10 @@ SemaphoreHandle_t alarmMutex;
 // 獨立任務處理 (TLS 握手需數秒)，避免卡住相機任務或 WebServer。
 #define NOTIFY_PREF_NAMESPACE "notify"
 Preferences notifyPrefs;
-String discordWebhook;            // 空字串 = 未設定/停用
-String telegramBotToken;          // 空字串 = 未設定/停用；格式 123456:ABC-...
-String telegramChatId;            // 收訊的 chat id (可為負數群組 id)
-SemaphoreHandle_t notifyMutex;    // 保護以上推播設定跨任務存取
+String discordWebhook;         // 空字串 = 未設定/停用
+String telegramBotToken;       // 空字串 = 未設定/停用；格式 123456:ABC-...
+String telegramChatId;         // 收訊的 chat id (可為負數群組 id)
+SemaphoreHandle_t notifyMutex; // 保護以上推播設定跨任務存取
 // 待推播的任務：alarmId (0 = 測試訊息) + 要推播到哪些管道
 struct NotifyJob
 {
@@ -205,7 +207,7 @@ struct NotifyJob
   bool toTelegram;
 };
 QueueHandle_t notifyQueue;
-volatile int tzOffsetMin = 0;     // 瀏覽器時區 (分鐘，UTC+8 = 480)，供訊息時間顯示
+volatile int tzOffsetMin = 0; // 瀏覽器時區 (分鐘，UTC+8 = 480)，供訊息時間顯示
 
 // ---------- 使用者登入保護 (HTTP Basic Auth) ----------
 // authUser 空字串 = 停用登入保護 (預設)，一旦設定，網頁 API 皆需登入才能存取
@@ -626,11 +628,13 @@ void detectMotionOnFrame(camera_fb_t *fb)
   for (int gy = 0; gy < MOTION_GRID; gy++)
   {
     int sy = cfg.y + (gy * cfg.h) / MOTION_GRID;
-    if (sy >= fb->height) sy = fb->height - 1;
+    if (sy >= fb->height)
+      sy = fb->height - 1;
     for (int gx = 0; gx < MOTION_GRID; gx++)
     {
       int sx = cfg.x + (gx * cfg.w) / MOTION_GRID;
-      if (sx >= fb->width) sx = fb->width - 1;
+      if (sx >= fb->width)
+        sx = fb->width - 1;
       uint16_t p = pix[sy * fb->width + sx];
       p = (p >> 8) | (p << 8);
       uint8_t r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F, b = p & 0x1F;
@@ -644,7 +648,8 @@ void detectMotionOnFrame(camera_fb_t *fb)
     int changed = 0;
     for (int i = 0; i < MOTION_GRID * MOTION_GRID; i++)
     {
-      if (abs((int)cur[i] - (int)prevGray[i]) > MOTION_PIXEL_DIFF) changed++;
+      if (abs((int)cur[i] - (int)prevGray[i]) > MOTION_PIXEL_DIFF)
+        changed++;
     }
     float ratio = changed * 100.0f / (MOTION_GRID * MOTION_GRID);
     motionDiff = ratio;
@@ -739,7 +744,8 @@ void addAlarmRecord(camera_fb_t *fb)
   rec->len = outLen;
   alarmLastId = id;
   alarmWrite = (alarmWrite + 1) % alarmCap;
-  if (alarmCount < alarmCap) alarmCount++;
+  if (alarmCount < alarmCap)
+    alarmCount++;
   if (sdMode)
   {
     saveAlarmIndexLocked();
@@ -801,8 +807,10 @@ void notifyTask(void *param)
     NotifyJob job;
     if (xQueueReceive(notifyQueue, &job, portMAX_DELAY) == pdTRUE)
     {
-      if (job.toDiscord) sendDiscordNotify(job.alarmId);
-      if (job.toTelegram) sendTelegramNotify(job.alarmId);
+      if (job.toDiscord)
+        sendDiscordNotify(job.alarmId);
+      if (job.toTelegram)
+        sendTelegramNotify(job.alarmId);
     }
   }
 }
@@ -902,12 +910,13 @@ void sendDiscordNotify(uint32_t alarmId)
 
   const String boundary = "----Esp32CamAlarmBoundary";
   String pre = "--" + boundary + "\r\n"
-               "Content-Disposition: form-data; name=\"payload_json\"\r\n"
-               "Content-Type: application/json\r\n\r\n" + payload;
+                                 "Content-Disposition: form-data; name=\"payload_json\"\r\n"
+                                 "Content-Type: application/json\r\n\r\n" +
+               payload;
   String imgHead = "\r\n--" + boundary + "\r\n"
-                   "Content-Disposition: form-data; name=\"files[0]\"; filename=\"alarm_" +
+                                         "Content-Disposition: form-data; name=\"files[0]\"; filename=\"alarm_" +
                    String(alarmId) + ".jpg\"\r\n"
-                   "Content-Type: image/jpeg\r\n\r\n";
+                                     "Content-Type: image/jpeg\r\n\r\n";
   String tail = "\r\n--" + boundary + "--\r\n";
 
   // Discord 要求整包 multipart，先在 PSRAM 組好再一次 POST
@@ -915,7 +924,8 @@ void sendDiscordNotify(uint32_t alarmId)
   uint8_t *body = (uint8_t *)ps_malloc(total);
   if (!body)
   {
-    if (jpg) free(jpg);
+    if (jpg)
+      free(jpg);
     Serial.println("Discord 通知失敗：PSRAM 配置失敗");
     return;
   }
@@ -1034,21 +1044,25 @@ void sendTelegramNotify(uint32_t alarmId)
 
   const String boundary = "----Esp32CamTgBoundary";
   String pre = "--" + boundary + "\r\n"
-               "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + chatId + "\r\n"
-               "--" + boundary + "\r\n"
-               "Content-Disposition: form-data; name=\"" + String(hasImage ? "caption" : "text") +
+                                 "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
+               chatId + "\r\n"
+                        "--" +
+               boundary + "\r\n"
+                          "Content-Disposition: form-data; name=\"" +
+               String(hasImage ? "caption" : "text") +
                "\"\r\n\r\n" + caption;
   String imgHead = "\r\n--" + boundary + "\r\n"
-                   "Content-Disposition: form-data; name=\"photo\"; filename=\"alarm_" +
+                                         "Content-Disposition: form-data; name=\"photo\"; filename=\"alarm_" +
                    String(alarmId) + ".jpg\"\r\n"
-                   "Content-Type: image/jpeg\r\n\r\n";
+                                     "Content-Type: image/jpeg\r\n\r\n";
   String tail = "\r\n--" + boundary + "--\r\n";
 
   size_t total = pre.length() + (hasImage ? imgHead.length() + jpgSize : 0) + tail.length();
   uint8_t *body = (uint8_t *)ps_malloc(total);
   if (!body)
   {
-    if (jpg) free(jpg);
+    if (jpg)
+      free(jpg);
     Serial.println("Telegram 通知失敗：PSRAM 配置失敗");
     return;
   }
@@ -1117,9 +1131,11 @@ void loadAppSettings()
   if (wifi)
   {
     cJSON *it = cJSON_GetObjectItem(wifi, "ssid");
-    if (cJSON_IsString(it)) sdWifiSsid = it->valuestring;
+    if (cJSON_IsString(it))
+      sdWifiSsid = it->valuestring;
     it = cJSON_GetObjectItem(wifi, "password");
-    if (cJSON_IsString(it)) sdWifiPassword = it->valuestring;
+    if (cJSON_IsString(it))
+      sdWifiPassword = it->valuestring;
   }
 
   cJSON *motion = cJSON_GetObjectItem(root, "motion");
@@ -1127,25 +1143,33 @@ void loadAppSettings()
   {
     MotionConfig cfg = motionCfg;
     cJSON *it = cJSON_GetObjectItem(motion, "enabled");
-    if (cJSON_IsBool(it)) cfg.enabled = cJSON_IsTrue(it);
+    if (cJSON_IsBool(it))
+      cfg.enabled = cJSON_IsTrue(it);
     it = cJSON_GetObjectItem(motion, "x");
-    if (cJSON_IsNumber(it)) cfg.x = it->valueint;
+    if (cJSON_IsNumber(it))
+      cfg.x = it->valueint;
     it = cJSON_GetObjectItem(motion, "y");
-    if (cJSON_IsNumber(it)) cfg.y = it->valueint;
+    if (cJSON_IsNumber(it))
+      cfg.y = it->valueint;
     it = cJSON_GetObjectItem(motion, "w");
-    if (cJSON_IsNumber(it)) cfg.w = it->valueint;
+    if (cJSON_IsNumber(it))
+      cfg.w = it->valueint;
     it = cJSON_GetObjectItem(motion, "h");
-    if (cJSON_IsNumber(it)) cfg.h = it->valueint;
+    if (cJSON_IsNumber(it))
+      cfg.h = it->valueint;
     it = cJSON_GetObjectItem(motion, "sens");
-    if (cJSON_IsNumber(it)) cfg.sensitivity = it->valueint;
+    if (cJSON_IsNumber(it))
+      cfg.sensitivity = it->valueint;
 
     // 邊界防呆：檔案可能被手動編輯過
     cfg.x = constrain(cfg.x, 0, TFT_WIDTH - 1);
     cfg.y = constrain(cfg.y, 0, TFT_HEIGHT - 1);
     cfg.w = constrain(cfg.w, 0, TFT_WIDTH - cfg.x);
     cfg.h = constrain(cfg.h, 0, TFT_HEIGHT - cfg.y);
-    if (cfg.sensitivity < 1 || cfg.sensitivity > 15) cfg.sensitivity = 4;
-    if (cfg.w < 8 || cfg.h < 8) cfg.enabled = false;
+    if (cfg.sensitivity < 1 || cfg.sensitivity > 15)
+      cfg.sensitivity = 4;
+    if (cfg.w < 8 || cfg.h < 8)
+      cfg.enabled = false;
     motionCfg = cfg;
   }
 
@@ -1153,20 +1177,25 @@ void loadAppSettings()
   if (notify)
   {
     cJSON *it = cJSON_GetObjectItem(notify, "webhook");
-    if (cJSON_IsString(it)) discordWebhook = it->valuestring;
+    if (cJSON_IsString(it))
+      discordWebhook = it->valuestring;
     it = cJSON_GetObjectItem(notify, "tgToken");
-    if (cJSON_IsString(it)) telegramBotToken = it->valuestring;
+    if (cJSON_IsString(it))
+      telegramBotToken = it->valuestring;
     it = cJSON_GetObjectItem(notify, "tgChatId");
-    if (cJSON_IsString(it)) telegramChatId = it->valuestring;
+    if (cJSON_IsString(it))
+      telegramChatId = it->valuestring;
   }
 
   cJSON *auth = cJSON_GetObjectItem(root, "auth");
   if (auth)
   {
     cJSON *it = cJSON_GetObjectItem(auth, "user");
-    if (cJSON_IsString(it)) authUser = it->valuestring;
+    if (cJSON_IsString(it))
+      authUser = it->valuestring;
     it = cJSON_GetObjectItem(auth, "pass");
-    if (cJSON_IsString(it)) authPass = it->valuestring;
+    if (cJSON_IsString(it))
+      authPass = it->valuestring;
   }
 
   cJSON_Delete(root);
@@ -1255,7 +1284,7 @@ void loadAlarmIndex()
   }
 
   cJSON *arr = cJSON_GetObjectItem(root, "alarms");
-  int n = cJSON_GetArraySize(arr); // arr 為 NULL 時回傳 0
+  int n = cJSON_GetArraySize(arr);             // arr 為 NULL 時回傳 0
   int start = n > alarmCap ? n - alarmCap : 0; // 超量只取最新 alarmCap 筆
   for (int i = start; i < n; i++)
   {
@@ -1322,11 +1351,15 @@ void saveAlarmIndexLocked()
 
 static void wrLE32(uint8_t *p, uint32_t v)
 {
-  p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+  p[0] = v;
+  p[1] = v >> 8;
+  p[2] = v >> 16;
+  p[3] = v >> 24;
 }
 static void wrLE16(uint8_t *p, uint16_t v)
 {
-  p[0] = v; p[1] = v >> 8;
+  p[0] = v;
+  p[1] = v >> 8;
 }
 static void wrFourcc(uint8_t *p, const char *s)
 {
@@ -1383,18 +1416,18 @@ bool startRecording()
 
   uint8_t hdr[224];
   memset(hdr, 0, sizeof(hdr));
-  wrFourcc(hdr + 0, "RIFF");                    // riffSize @4 回填
+  wrFourcc(hdr + 0, "RIFF"); // riffSize @4 回填
   wrFourcc(hdr + 8, "AVI ");
   wrFourcc(hdr + 12, "LIST");
   wrLE32(hdr + 16, 192);
   wrFourcc(hdr + 20, "hdrl");
   wrFourcc(hdr + 24, "avih");
   wrLE32(hdr + 28, 56);
-  wrLE32(hdr + 32, 1000000 / RECORD_FPS);       // dwMicroSecPerFrame
-  wrLE32(hdr + 36, 400000);                     // dwMaxBytesPerSec (估)
-  wrLE32(hdr + 44, 0x10);                       // AVIF_HASINDEX
-  wrLE32(hdr + 56, 1);                          // dwStreams
-  wrLE32(hdr + 60, 32768);                      // dwSuggestedBufferSize
+  wrLE32(hdr + 32, 1000000 / RECORD_FPS); // dwMicroSecPerFrame
+  wrLE32(hdr + 36, 400000);               // dwMaxBytesPerSec (估)
+  wrLE32(hdr + 44, 0x10);                 // AVIF_HASINDEX
+  wrLE32(hdr + 56, 1);                    // dwStreams
+  wrLE32(hdr + 60, 32768);                // dwSuggestedBufferSize
   wrLE32(hdr + 64, TFT_WIDTH);
   wrLE32(hdr + 68, TFT_HEIGHT);
   wrFourcc(hdr + 88, "LIST");
@@ -1404,21 +1437,21 @@ bool startRecording()
   wrLE32(hdr + 104, 56);
   wrFourcc(hdr + 108, "vids");
   wrFourcc(hdr + 112, "MJPG");
-  wrLE32(hdr + 128, 1);                         // dwScale
-  wrLE32(hdr + 132, RECORD_FPS);                // dwRate -> fps
-  wrLE32(hdr + 144, 32768);                     // dwSuggestedBufferSize
-  wrLE16(hdr + 160, TFT_WIDTH);                 // rcFrame.right
-  wrLE16(hdr + 162, TFT_HEIGHT);                // rcFrame.bottom
+  wrLE32(hdr + 128, 1);          // dwScale
+  wrLE32(hdr + 132, RECORD_FPS); // dwRate -> fps
+  wrLE32(hdr + 144, 32768);      // dwSuggestedBufferSize
+  wrLE16(hdr + 160, TFT_WIDTH);  // rcFrame.right
+  wrLE16(hdr + 162, TFT_HEIGHT); // rcFrame.bottom
   wrFourcc(hdr + 164, "strf");
   wrLE32(hdr + 168, 40);
-  wrLE32(hdr + 172, 40);                        // biSize
+  wrLE32(hdr + 172, 40); // biSize
   wrLE32(hdr + 176, TFT_WIDTH);
   wrLE32(hdr + 180, TFT_HEIGHT);
-  wrLE16(hdr + 184, 1);                         // biPlanes
-  wrLE16(hdr + 186, 24);                        // biBitCount
-  wrFourcc(hdr + 188, "MJPG");                  // biCompression
+  wrLE16(hdr + 184, 1);        // biPlanes
+  wrLE16(hdr + 186, 24);       // biBitCount
+  wrFourcc(hdr + 188, "MJPG"); // biCompression
   wrLE32(hdr + 192, TFT_WIDTH * TFT_HEIGHT * 3);
-  wrFourcc(hdr + 212, "LIST");                  // moviSize @216 回填
+  wrFourcc(hdr + 212, "LIST"); // moviSize @216 回填
   wrFourcc(hdr + 220, "movi");
   recFile.write(hdr, sizeof(hdr));
   xSemaphoreGive(sdMutex);
@@ -1549,7 +1582,8 @@ bool checkAuth()
 
 void handleAuthConfigGet()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(authMutex, portMAX_DELAY);
   bool enabled = authUser.length() > 0;
   String u = authUser;
@@ -1563,7 +1597,8 @@ void handleAuthConfigGet()
 // 密碼至少 4 個字元
 void handleAuthConfigSet()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
 
   String u = server.arg("user");
   u.trim();
@@ -1599,7 +1634,8 @@ void handleAuthConfigSet()
 
 void handleRoot()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   File f = SPIFFS.open("/index.html", "r");
   if (!f)
   {
@@ -1629,7 +1665,8 @@ void handleCaptivePortal()
 
 void handleScan()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   int n = WiFi.scanNetworks();
   String json = "[";
   for (int i = 0; i < n; i++)
@@ -1648,7 +1685,8 @@ void handleScan()
 
 void handleConnect()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   if (!server.hasArg("ssid") || server.arg("ssid").length() == 0)
   {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing ssid\"}");
@@ -1681,7 +1719,8 @@ void handleConnect()
 
 void handleStatus()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   bool connected = WiFi.status() == WL_CONNECTED;
   String json = "{";
   json += "\"connected\":" + String(connected ? "true" : "false");
@@ -1697,7 +1736,8 @@ void handleStatus()
 
 void handleCapture()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   if (!cameraOk)
   {
     server.send(503, "application/json", "{\"error\":\"camera not ready\"}");
@@ -1724,7 +1764,8 @@ void handleCapture()
 
 void handleClearWifi()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   if (sdMode)
   {
     sdWifiSsid = "";
@@ -1750,7 +1791,8 @@ void handleClearWifi()
 // 設定偵測區域/靈敏度 (POST enabled=0|1&x&y&w&h&sens，座標為感光元件方向 240x240)
 void handleMotionConfig()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   bool enabled = server.arg("enabled") == "1";
   int x = server.arg("x").toInt();
   int y = server.arg("y").toInt();
@@ -1762,8 +1804,10 @@ void handleMotionConfig()
   y = constrain(y, 0, TFT_HEIGHT - 1);
   w = constrain(w, 0, TFT_WIDTH - x);
   h = constrain(h, 0, TFT_HEIGHT - y);
-  if (sens < 1 || sens > 15) sens = 4;
-  if (w < 8 || h < 8) enabled = false;
+  if (sens < 1 || sens > 15)
+    sens = 4;
+  if (w < 8 || h < 8)
+    enabled = false;
 
   xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
   motionCfg = {enabled, x, y, w, h, sens};
@@ -1780,7 +1824,8 @@ void handleMotionConfig()
 
 void handleMotionStatus()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(motionCfgMutex, portMAX_DELAY);
   MotionConfig cfg = motionCfg;
   xSemaphoreGive(motionCfgMutex);
@@ -1803,13 +1848,15 @@ void handleMotionStatus()
 // 告警清單 (新到舊)：[{"id":N,"time":epoch}, ...]
 void handleAlarmList()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
   String json = "[";
   for (int i = 0; i < alarmCount; i++)
   {
     int idx = ((alarmWrite - 1 - i) % alarmCap + alarmCap) % alarmCap;
-    if (i > 0) json += ",";
+    if (i > 0)
+      json += ",";
     json += "{\"id\":" + String(alarmList[idx].id) +
             ",\"time\":" + String((uint32_t)alarmList[idx].epoch) + "}";
   }
@@ -1820,7 +1867,8 @@ void handleAlarmList()
 
 void handleAlarmImage()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   uint32_t id = (uint32_t)server.arg("id").toInt();
 
   if (sdMode)
@@ -1859,7 +1907,8 @@ void handleAlarmImage()
 
 void handleAlarmClear()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(alarmMutex, portMAX_DELAY);
   for (int i = 0; i < alarmCap; i++)
   {
@@ -1890,7 +1939,8 @@ void handleAlarmClear()
 // 錄影檔清單 (檔名含日期時間，由網頁端解析排序)
 void handleRecList()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   if (!sdMode)
   {
     server.send(200, "application/json", "[]");
@@ -1908,14 +1958,16 @@ void handleRecList()
       String name = f.name();
       if (!f.isDirectory() && name.endsWith(".avi"))
       {
-        if (!first) json += ",";
+        if (!first)
+          json += ",";
         first = false;
         json += "{\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String((uint32_t)f.size()) + "}";
       }
       f.close();
     }
   }
-  if (dir) dir.close();
+  if (dir)
+    dir.close();
   json += "]";
   xSemaphoreGive(sdMutex);
   server.send(200, "application/json", json);
@@ -1932,7 +1984,8 @@ static bool validRecName(const String &name)
 // 卡死 core 0 的錄影寫入
 void handleRecFile()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   String name = server.arg("name");
   if (!sdMode || !validRecName(name))
   {
@@ -1987,7 +2040,8 @@ void handleRecFile()
 
 void handleRecDelete()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   String name = server.arg("name");
   if (!sdMode || !validRecName(name))
   {
@@ -2011,7 +2065,8 @@ void handleRecDelete()
 // 網頁載入時 POST epoch=秒&tz=時區分鐘 同步時間 (AP 模式沒網路拿不到 NTP)
 void handleTimeSync()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   long long epoch = atoll(server.arg("epoch").c_str());
   if (epoch > 1000000000LL)
   {
@@ -2029,7 +2084,8 @@ void handleTimeSync()
 
 void handleNotifyConfigGet()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   String url = discordWebhook;
   String tgToken = telegramBotToken;
@@ -2045,7 +2101,8 @@ void handleNotifyConfigGet()
 // 未出現的欄位維持原值 (Discord 卡片與 Telegram 卡片各自獨立送出)。傳空字串 = 清除/停用該管道。
 void handleNotifyConfigSet()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   bool hasWebhook = server.hasArg("webhook");
   bool hasTgToken = server.hasArg("tgToken");
   bool hasTgChatId = server.hasArg("tgChatId");
@@ -2072,9 +2129,12 @@ void handleNotifyConfigSet()
   tgChatId.trim();
 
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
-  if (hasWebhook) discordWebhook = url;
-  if (hasTgToken) telegramBotToken = tgToken;
-  if (hasTgChatId) telegramChatId = tgChatId;
+  if (hasWebhook)
+    discordWebhook = url;
+  if (hasTgToken)
+    telegramBotToken = tgToken;
+  if (hasTgChatId)
+    telegramChatId = tgChatId;
   xSemaphoreGive(notifyMutex);
 
   if (sdMode)
@@ -2084,9 +2144,12 @@ void handleNotifyConfigSet()
   else
   {
     notifyPrefs.begin(NOTIFY_PREF_NAMESPACE, false);
-    if (hasWebhook) notifyPrefs.putString("webhook", url);
-    if (hasTgToken) notifyPrefs.putString("tgToken", tgToken);
-    if (hasTgChatId) notifyPrefs.putString("tgChatId", tgChatId);
+    if (hasWebhook)
+      notifyPrefs.putString("webhook", url);
+    if (hasTgToken)
+      notifyPrefs.putString("tgToken", tgToken);
+    if (hasTgChatId)
+      notifyPrefs.putString("tgChatId", tgChatId);
     notifyPrefs.end();
   }
 
@@ -2104,7 +2167,8 @@ void handleNotifyConfigSet()
 // 排入一則測試訊息 (不帶圖片，只送 Discord)，實際結果看序列埠與 Discord 頻道
 void handleNotifyTest()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   bool hasWebhook = discordWebhook.length() > 0;
   xSemaphoreGive(notifyMutex);
@@ -2130,7 +2194,8 @@ void handleNotifyTest()
 // 排入一則測試訊息 (不帶圖片，只送 Telegram)，實際結果看序列埠與 Telegram 對話
 void handleNotifyTelegramTest()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   xSemaphoreTake(notifyMutex, portMAX_DELAY);
   bool hasTelegram = telegramBotToken.length() > 0 && telegramChatId.length() > 0;
   xSemaphoreGive(notifyMutex);
@@ -2156,7 +2221,8 @@ void handleNotifyTelegramTest()
 // 上傳結束後回覆結果；成功則重新啟動套用新韌體/新網頁資料
 void handleUpdateFinished()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   server.sendHeader("Connection", "close");
   if (otaSuccess)
   {
@@ -2207,7 +2273,8 @@ void handleUpdateUpload()
   }
   else if (upload.status == UPLOAD_FILE_WRITE)
   {
-    if (!otaAuthOk) return;
+    if (!otaAuthOk)
+      return;
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
     {
       Update.printError(Serial);
@@ -2215,7 +2282,8 @@ void handleUpdateUpload()
   }
   else if (upload.status == UPLOAD_FILE_END)
   {
-    if (!otaAuthOk) return;
+    if (!otaAuthOk)
+      return;
     if (Update.end(true))
     {
       otaSuccess = true;
@@ -2228,7 +2296,8 @@ void handleUpdateUpload()
   }
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
-    if (!otaAuthOk) return;
+    if (!otaAuthOk)
+      return;
     Update.abort();
     otaInProgress = false;
     Serial.println("OTA 已中斷");
@@ -2237,7 +2306,8 @@ void handleUpdateUpload()
 
 void handleLed()
 {
-  if (!checkAuth()) return;
+  if (!checkAuth())
+    return;
   if (server.hasArg("state"))
   {
     String s = server.arg("state");
