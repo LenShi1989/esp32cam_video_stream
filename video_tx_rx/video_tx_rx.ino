@@ -1,7 +1,8 @@
 /*
   esp32cam_video_stream
 
-  Arduino 3.3.10 version
+  Arduino_1.8.19 version
+  ESP32 Board 3.3.10 version
 
   雙核心分工 (依 CLAUDE.md)：
     - 原始核心 (core 1，即 Arduino setup()/loop())：
