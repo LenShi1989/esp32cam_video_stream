@@ -246,10 +246,25 @@ function updateRotateUI() {
 }
 updateRotateUI();
 
+// 韌體本身不知道瀏覽器端的旋轉角度 (僅存在 localStorage)，需主動同步，
+// 否則告警擷取與 Discord/Telegram 推播圖片仍會是感光元件原始方向 (顛倒)
+async function syncRotateToDevice(deg) {
+  try {
+    await fetch("/rotate", {
+      method: "POST",
+      body: new URLSearchParams({ deg: String(deg) }),
+    });
+  } catch (e) {
+    /* 失敗時裝置端維持舊角度，下次旋轉或重新整理頁面會再送出 */
+  }
+}
+syncRotateToDevice(rotateDeg); // 頁面載入 (含裝置重開機後) 立即同步目前角度
+
 function cycleRotate() {
   rotateDeg = (rotateDeg + 90) % 360;
   localStorage.setItem("rotateDeg", rotateDeg);
   updateRotateUI();
+  syncRotateToDevice(rotateDeg);
   drawOverlay(); // 偵測區域以感光元件座標保存，旋轉後重畫對應的顯示位置
 }
 streamRotateBtn.addEventListener("click", cycleRotate);
@@ -706,7 +721,8 @@ async function loadAlarms() {
       const img = document.createElement("img");
       img.src = link.href;
       img.loading = "lazy";
-      img.style.transform = "rotate(" + rotateDeg + "deg)"; // 與串流頁同角度顯示
+      // 告警圖片已在韌體端依目前旋轉角度轉正 (見 /rotate)，此處不再另外用 CSS 旋轉，
+      // 否則會變成轉兩次
       link.appendChild(img);
 
       const info = document.createElement("div");

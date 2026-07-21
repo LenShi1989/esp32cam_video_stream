@@ -1,5 +1,7 @@
 # esp32cam 影像傳輸
 
+## 使用中文回復
+
 原始核心:1
 
 - Web Server
@@ -101,7 +103,10 @@ Setup24_ST7789.h 設定
     - 輸入 SSID + PASSWORD 送出連線（POST `/connect`，同時存入 NVS，下次開機自動嘗試重連）
     - 清除 SSID 按鍵（POST `/clear`，清除 NVS 設定並斷開 STA，熱點保持開啟可重新設定）
   - 影像串流：瀏覽器輪詢 GET `/capture`（相機任務將 RGB565 幀以 frame2jpg 轉 JPEG 快照回傳）顯示即時影像
-    - 旋轉按鈕：0°/90°/180°/270° 循環切換（瀏覽器端 canvas 旋轉，與移動偵測共用角度，存 localStorage）
+    - 旋轉按鈕：0°/90°/180°/270° 循環切換（瀏覽器端 canvas 旋轉，與移動偵測共用角度，存 localStorage）；
+      同步 POST `/rotate`（`deg` 欄位）把角度告知裝置（頁面載入與每次切換都會送出），
+      韌體依此角度旋轉告警擷取/推播圖片（`alarmRotateDeg`），避免即時畫面已轉正、
+      但 Discord/Telegram 推播與告警紀錄截圖仍是感光元件原始方向（顛倒）的問題
   - 移動偵測：在影像上拖曳框選偵測區域，**偵測在 ESP32 裝置端 (core 0) 逐幀進行**，關閉網頁仍持續監控
     - 網頁 POST `/motion/config`（enabled/x/y/w/h/sens）設定區域與靈敏度；區域以感光元件方向的 240x240 座標保存，
       網頁端負責把旋轉後的框選反向換算回感光元件座標

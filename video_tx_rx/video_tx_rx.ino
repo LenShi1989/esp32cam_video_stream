@@ -190,6 +190,11 @@ int alarmCount = 0;                // 目前保存筆數 (<= alarmCap)
 volatile uint32_t alarmLastId = 0; // 最新一筆 id，網頁輪詢比對用
 SemaphoreHandle_t alarmMutex;
 
+// 網頁「旋轉」按鈕僅在瀏覽器端以 canvas/CSS 旋轉顯示，韌體本身不知情；
+// 由網頁 POST /rotate 同步目前角度，讓告警擷取與 Discord/Telegram 推播圖片
+// 的方向也一併旋轉，才不會出現「即時畫面轉正了，截圖/推播卻是顛倒的」的問題
+volatile uint16_t alarmRotateDeg = 0; // 0/90/180/270 (順時針)，僅供告警擷取使用
+
 // ---------- Discord / Telegram 推播通知 ----------
 // 告警觸發時把「時間 + 擷取圖片」推播到 Discord Webhook 和/或 Telegram Bot，
 // 手機裝對應 App 並開啟通知即可收到推播。需 STA 連上可上網的 Wi-Fi。傳送由
@@ -262,6 +267,7 @@ void handleCapture();
 void handleClearWifi();
 void handleMotionConfig();
 void handleMotionStatus();
+void handleRotateConfig();
 void handleAlarmList();
 void handleAlarmImage();
 void handleAlarmClear();
@@ -371,6 +377,7 @@ void setup()
   server.on("/clear", HTTP_POST, handleClearWifi);
   server.on("/motion/config", HTTP_POST, handleMotionConfig);
   server.on("/motion/status", HTTP_GET, handleMotionStatus);
+  server.on("/rotate", HTTP_POST, handleRotateConfig);
   server.on("/alarms", HTTP_GET, handleAlarmList);
   server.on("/alarm/img", HTTP_GET, handleAlarmImage);
   server.on("/alarm/clear", HTTP_POST, handleAlarmClear);
@@ -676,13 +683,85 @@ void detectMotionOnFrame(camera_fb_t *fb)
   prevValid = true;
 }
 
+// 將 RGB565 影像依 deg (順時針 0/90/180/270) 旋轉一份新緩衝區 (配置在 PSRAM，
+// 呼叫端需自行 free())，與網頁旋轉顯示的方向保持一致。90/270 時寬高互換。
+static uint16_t *rotateRgb565(const uint16_t *src, int w, int h, int deg, int *outW, int *outH)
+{
+  if (deg != 90 && deg != 180 && deg != 270)
+  {
+    *outW = w;
+    *outH = h;
+    uint16_t *dst = (uint16_t *)ps_malloc((size_t)w * h * sizeof(uint16_t));
+    if (dst)
+      memcpy(dst, src, (size_t)w * h * sizeof(uint16_t));
+    return dst;
+  }
+
+  int dw = (deg == 180) ? w : h;
+  int dh = (deg == 180) ? h : w;
+  uint16_t *dst = (uint16_t *)ps_malloc((size_t)dw * dh * sizeof(uint16_t));
+  if (!dst)
+    return NULL;
+
+  for (int y = 0; y < h; y++)
+  {
+    for (int x = 0; x < w; x++)
+    {
+      int nx, ny;
+      if (deg == 90)
+      {
+        nx = h - 1 - y;
+        ny = x;
+      }
+      else if (deg == 270)
+      {
+        nx = y;
+        ny = w - 1 - x;
+      }
+      else // 180
+      {
+        nx = w - 1 - x;
+        ny = h - 1 - y;
+      }
+      dst[ny * dw + nx] = src[y * w + x];
+    }
+  }
+  *outW = dw;
+  *outH = dh;
+  return dst;
+}
+
 // 觸發告警：把當下畫面轉 JPEG 存進環形緩衝 (滿了覆蓋最舊一筆)。
 // TFT 模式存 PSRAM；SD 模式寫入 /alarms/<id>.jpg 並更新 index.json。
 void addAlarmRecord(camera_fb_t *fb)
 {
+  // 告警擷取/推播圖片依網頁目前的旋轉角度先轉正，避免 Discord/Telegram
+  // 收到的截圖方向與即時串流顯示不一致
+  uint16_t rotDeg = alarmRotateDeg;
+  camera_fb_t rotFb;
+  uint16_t *rotBuf = NULL;
+  camera_fb_t *srcFb = fb;
+  if (rotDeg != 0 && fb->format == PIXFORMAT_RGB565)
+  {
+    int rw = 0, rh = 0;
+    rotBuf = rotateRgb565((const uint16_t *)fb->buf, fb->width, fb->height, rotDeg, &rw, &rh);
+    if (rotBuf)
+    {
+      rotFb = *fb;
+      rotFb.buf = (uint8_t *)rotBuf;
+      rotFb.width = rw;
+      rotFb.height = rh;
+      rotFb.len = (size_t)rw * rh * sizeof(uint16_t);
+      srcFb = &rotFb;
+    }
+  }
+
   uint8_t *out = NULL;
   size_t outLen = 0;
-  if (!frame2jpg(fb, 80, &out, &outLen))
+  bool ok = frame2jpg(srcFb, 80, &out, &outLen);
+  if (rotBuf)
+    free(rotBuf);
+  if (!ok)
   {
     Serial.println("告警擷取失敗：frame2jpg 錯誤");
     return;
@@ -1844,6 +1923,16 @@ void handleMotionStatus()
   json += ",\"recording\":" + String(recording ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
+}
+
+// 網頁旋轉按鈕變更角度時同步呼叫，讓告警擷取/推播圖片方向與即時串流顯示一致
+void handleRotateConfig()
+{
+  if (!checkAuth())
+    return;
+  int deg = server.arg("deg").toInt();
+  alarmRotateDeg = (deg == 90 || deg == 180 || deg == 270) ? deg : 0;
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // 告警清單 (新到舊)：[{"id":N,"time":epoch}, ...]
