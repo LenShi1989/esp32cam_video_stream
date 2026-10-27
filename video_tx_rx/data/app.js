@@ -40,6 +40,7 @@ const stSsid = document.getElementById("stSsid");
 const stIp = document.getElementById("stIp");
 const stCam = document.getElementById("stCam");
 const stStorage = document.getElementById("stStorage");
+const stAp = document.getElementById("stAp");
 const ledBtn = document.getElementById("ledBtn");
 const ledBtnText = document.getElementById("ledBtnText");
 
@@ -89,6 +90,8 @@ async function refreshStatus() {
     stStorage.textContent = data.sd
       ? "SD 卡 (appsetting.json)"
       : "NVS / RAM (TFT 模式)";
+    stAp.textContent =
+      (data.apSsid || "ESP32-CAM-XXXX") + " / 192.168.4.1";
 
     if (!ledSyncing) setLedUI(!!data.led);
   } catch (e) {

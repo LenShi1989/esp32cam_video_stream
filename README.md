@@ -156,7 +156,7 @@ Setup24_ST7789.h 設定
 3. 燒錄 `video_tx_rx/video_tx_rx.ino`（需安裝 TFT_eSPI 函式庫；cJSON 為 arduino-esp32 內建）
 4. 將 `video_tx_rx/data/` 三個網頁檔上傳到 SPIFFS（ESP32 Sketch Data Upload 外掛，
    或 mkspiffs 打包後從網頁 OTA 上傳，見下節）
-5. 連上熱點 `esp32_init`（開放網路）→ 瀏覽器開 `http://192.168.4.1`
+5. 連上熱點 `ESP32-CAM-XXXX`（`XXXX` 為 MAC 後 4 碼，開放網路）→ 瀏覽器開 `http://192.168.4.1`
 
 ### 打包 SPIFFS 映像檔並從網頁 OTA 更新
 

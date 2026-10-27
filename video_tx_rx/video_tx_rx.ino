@@ -6,7 +6,7 @@
 
   雙核心分工 (依 CLAUDE.md)：
     - 原始核心 (core 1，即 Arduino setup()/loop())：
-      Web Server：開 AP (SSID esp32_init) -> 掃描/設定 Wi-Fi -> 連線成功後
+      Web Server：開 AP (SSID ESP32-CAM-<MAC 後 4 碼>) -> 掃描/設定 Wi-Fi -> 連線成功後
       提供網頁開關控制 GPIO4 LED 亮滅。
     - 備用核心 (core 0，透過 xTaskCreatePinnedToCore 建立)：
       相機擷取影像並直接串流顯示到外接的 ST7789 240x240 TFT LCD，不經過 WiFi。
@@ -78,7 +78,8 @@
 
 // ---------- Web Server / Wi-Fi / LED 設定 ----------
 #define LED_PIN 4 // AI-Thinker 板載強光 LED，與相機腳位不衝突
-#define AP_SSID "esp32_init"
+#define AP_SSID_PREFIX "ESP32-CAM-" // 後面接 MAC 後 4 碼，避免多台裝置熱點同名
+char apSsid[24] = AP_SSID_PREFIX;
 #define WIFI_PREF_NAMESPACE "wifi"
 static const unsigned long STA_CONNECT_TIMEOUT_MS = 15000;
 static const byte DNS_PORT = 53;
@@ -319,20 +320,26 @@ void setup()
     Serial.println("未偵測到 SD 卡：TFT 模式，設定存 NVS，告警存 RAM");
   }
 
-  // AP + STA 同時開啟：手機可持續連著 esp32_init 這個熱點進行設定，
+  // AP + STA 同時開啟：手機可持續連著本機熱點進行設定，
   // 同時 ESP32 也能以 STA 模式連上使用者選擇的 Wi-Fi。
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID);
+
+  // AP SSID = ESP32-CAM-<MAC 後 4 碼>，方便在多台裝置間辨識要連哪一台
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(apSsid, sizeof(apSsid), "%s%02X%02X", AP_SSID_PREFIX, mac[4], mac[5]);
+
+  WiFi.softAP(apSsid);
   // 降低 WiFi 發射功率以減少尖峰電流，避免與相機/TFT 同時運作時因供電不足
   // (電壓瞬間下降) 導致 SPI Flash 讀取錯誤而觸發 IllegalInstruction 當機。
   // 供電穩定 (建議由外部 5V/2A 供應並加大電容旁路) 後可調高或移除此行。
   WiFi.setTxPower(WIFI_POWER_11dBm);
   Serial.print("AP 已啟動，SSID: ");
-  Serial.println(AP_SSID);
+  Serial.println(apSsid);
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
-  // DNS 全導向 AP IP：手機/電腦連上 esp32_init 熱點時，系統的 captive portal
+  // DNS 全導向 AP IP：手機/電腦連上本機熱點 (ESP32-CAM-XXXX) 時，系統的 captive portal
   // 偵測請求 (如 connectivitycheck.gstatic.com、captive.apple.com) 會被導到本機，
   // 收到非預期回應後系統即自動彈出瀏覽器視窗導向設定頁。
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
@@ -1726,7 +1733,7 @@ void handleRoot()
   f.close();
 }
 
-// 攔截所有未註冊的路徑 (server.onNotFound)。手機/電腦連上 esp32_init 熱點後
+// 攔截所有未註冊的路徑 (server.onNotFound)。手機/電腦連上本機熱點 (ESP32-CAM-XXXX) 後
 // 會發出各種 captive portal 偵測請求 (connectivitycheck.gstatic.com/generate_204、
 // captive.apple.com/hotspot-detect.html、msftconnecttest.com/connecttest.txt 等)，
 // 這些網域經 dnsServer 全部解析到 AP IP，request 進來時 Host 不是 AP IP 本身，
@@ -1807,6 +1814,7 @@ void handleStatus()
   json += ",\"connecting\":" + String(staConnecting ? "true" : "false");
   json += ",\"ip\":\"" + (connected ? WiFi.localIP().toString() : String("")) + "\"";
   json += ",\"ssid\":\"" + jsonEscape(connected ? WiFi.SSID() : String("")) + "\"";
+  json += ",\"apSsid\":\"" + jsonEscape(String(apSsid)) + "\"";
   json += ",\"led\":" + String(ledState ? "true" : "false");
   json += ",\"camera\":" + String(cameraOk ? "true" : "false");
   json += ",\"sd\":" + String(sdMode ? "true" : "false");
@@ -1860,7 +1868,7 @@ void handleClearWifi()
   }
 
   staConnecting = false;
-  // 只斷開 STA 並清除 WiFi 函式庫內部記住的 AP 資訊，softAP (esp32_init) 保持運作，
+  // 只斷開 STA 並清除 WiFi 函式庫內部記住的 AP 資訊，softAP (ESP32-CAM-XXXX) 保持運作，
   // 使用者可繼續連著熱點重新掃描/設定 Wi-Fi
   WiFi.disconnect(false, true);
   Serial.println("已清除儲存的 Wi-Fi 設定並斷線");
